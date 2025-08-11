@@ -49,37 +49,60 @@ def process_layer(idx, layer, m, k, n, iterations):
         f.write(f"layers[{idx}] = kernel::create(f{idx});\n")
         f.write(f"connect<window<{num_bytes:>5}>>({in_port}.out[0], layers[{idx}].in[0]);\n\n")
 
+def golden_fc(x, k, is_relu, shift):
+    # for recording purposes, fc1 in the toy golden example
+    # is_relu = True
+    # shift = 2
+    # x = np.random.randint(0, 128, size=(16, 32), dtype=np.int8)
+    # k = np.random.randint(0, 128, size=(32, 32), dtype=np.int8)
+
+    # fc2 in the toy golden example
+#    is_relu = False
+#    shift = 3
+#    x = a
+#    k = np.random.randint(0, 128, size=(32, 64), dtype=np.int8)
+#    y = np.matmul(x.astype(np.int32), k.astype(np.int32))
+#    y = (y >> shift).astype(np.int8)
+#    a = np.maximum(0, y) if is_relu else y
+#    layers += [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
+
+    # fc3 in the original toy golden example
+#    is_relu = True
+#    shift = 4
+#    x = a
+#    k = np.random.randint(0, 128, size=(64, 32), dtype=np.int8)
+#    y = np.matmul(x.astype(np.int32), k.astype(np.int32))
+#    y = (y >> shift).astype(np.int8)
+#    a = np.maximum(0, y) if is_relu else y
+#    layers += [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
+
+
+
+    y = np.matmul(x.astype(np.int32), k.astype(np.int32))
+    y = (y >> shift).astype(np.int8)
+    a = np.maximum(0, y) if is_relu else y
+    layer_fc =  [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
+    return a, layer_fc 
+   
 
 if __name__ == "__main__":
     
     layers = []
 
-    is_relu = True
-    shift = 2
-    x = np.random.randint(0, 128, size=(16, 32), dtype=np.int8)
-    k = np.random.randint(0, 128, size=(32, 32), dtype=np.int8)
-    y = np.matmul(x.astype(np.int32), k.astype(np.int32))
-    y = (y >> shift).astype(np.int8)
-    a = np.maximum(0, y) if is_relu else y
-    layers += [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
 
-    is_relu = False
-    shift = 3
-    x = a
-    k = np.random.randint(0, 128, size=(32, 64), dtype=np.int8)
-    y = np.matmul(x.astype(np.int32), k.astype(np.int32))
-    y = (y >> shift).astype(np.int8)
-    a = np.maximum(0, y) if is_relu else y
-    layers += [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
+    # particle accelerator dim
+    in_particles, num_feature, num_feature_pad, ff_dim = 150, 3, 32, 64
+    # golden dense layer dim
+    m1, k1, n1, m2, k2, n2, m3, k3, n3 = 16, 32, 32, 16, 32, 64, 16, 64, 32 # matmul goes m * k * n
 
-    is_relu = True
-    shift = 4
-    x = a
-    k = np.random.randint(0, 128, size=(64, 32), dtype=np.int8)
-    y = np.matmul(x.astype(np.int32), k.astype(np.int32))
-    y = (y >> shift).astype(np.int8)
-    a = np.maximum(0, y) if is_relu else y
-    layers += [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
+    # dense layer to get to MHA 1 
+    dummy_inp = np.random.randint(0, 128, size=(in_particles, num_feature), dtype=np.int8)
+    pad_inp = np.zeroes((in_particles, num_feature_pad), dtype=np.int8)
+    pad_inp[:, :num_feature] = dummy_inp; 
+
+    a1, layer_fc1 = golden_fc(pad_inp, np.random.randint(0, 128, size=(k2, n2), dtype=np.int8), True, 3) # n2 matches ff_dim, k2 matches padding
+
+
 
     m, k, n = 2,8,8 # k==n such that output matrix can be fed as input without re-tiling
     iterations = 5
