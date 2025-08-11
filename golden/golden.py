@@ -101,7 +101,7 @@ if __name__ == "__main__":
     
     layers += layer_fc1
 
-    from np_mha_linear import NumpyMHALinear, residual_add_int8
+    from utils.np_mha_linear import NumpyMHALinear, residual_add_int8
     import numpy as np
     numheads = 4
     mha1 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha1", seed=0)
