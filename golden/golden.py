@@ -49,7 +49,7 @@ def process_layer(idx, layer, m, k, n, iterations):
         f.write(f"layers[{idx}] = kernel::create(f{idx});\n")
         f.write(f"connect<window<{num_bytes:>5}>>({in_port}.out[0], layers[{idx}].in[0]);\n\n")
 
-def golden_fc(x, k, is_relu, shift):
+
     # for recording purposes, fc1 in the toy golden example
     # is_relu = True
     # shift = 2
@@ -75,9 +75,7 @@ def golden_fc(x, k, is_relu, shift):
 #    y = (y >> shift).astype(np.int8)
 #    a = np.maximum(0, y) if is_relu else y
 #    layers += [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
-
-
-
+def golden_fc(x, k, is_relu, shift):
     y = np.matmul(x.astype(np.int32), k.astype(np.int32))
     y = (y >> shift).astype(np.int8)
     a = np.maximum(0, y) if is_relu else y
@@ -87,9 +85,8 @@ def golden_fc(x, k, is_relu, shift):
 
 if __name__ == "__main__":
     
+    ################################################## PYTHON REFERENCE ##################################################  
     layers = []
-
-
     # particle accelerator dim
     in_particles, num_feature, num_feature_pad, ff_dim = 150, 3, 32, 64
     # golden dense layer dim
@@ -101,6 +98,20 @@ if __name__ == "__main__":
     pad_inp[:, :num_feature] = dummy_inp; 
 
     a1, layer_fc1 = golden_fc(pad_inp, np.random.randint(0, 128, size=(k2, n2), dtype=np.int8), True, 3) # n2 matches ff_dim, k2 matches padding
+    
+    layers += layer_fc1
+
+    from np_mha_linear import NumpyMHALinear, residual_add_int8
+    import numpy as np
+    numheads = 4
+    mha1 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha1", seed=0)
+    att1 = mha1(a1, a1, a1, layers=layers)       # like: MHA(...)(emb, emb, emb)
+    a2 = residual_add_int8(att1, a1)
+
+
+
+    ################################################## PYTHON REFERENCE END #################################################  
+
 
 
 
