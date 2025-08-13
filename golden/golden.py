@@ -1,5 +1,7 @@
 import numpy as np
 import os, glob, shutil, subprocess
+from utils.np_mha_linear import NumpyMHALinear, residual_add_int8
+
 
 def tile_matrix(matrix, row_tiles, col_tiles): # (R,C) -> (R/r, C/c, r, c).flatten()
     rows, cols = matrix.shape
@@ -49,6 +51,14 @@ def process_layer(idx, layer, m, k, n, iterations):
         f.write(f"layers[{idx}] = kernel::create(f{idx});\n")
         f.write(f"connect<window<{num_bytes:>5}>>({in_port}.out[0], layers[{idx}].in[0]);\n\n")
 
+def print_layers_brief(layers):
+    for i, L in enumerate(layers):
+        name = L.get('name', f'dense{i}')
+        xsh = tuple(L['x'].shape)
+        ksh = tuple(L['k'].shape)
+        sh  = L['shift']
+        act = 'ReLU' if L['is_relu'] else 'Linear'
+        print(f"{i:02d} {name:12s}  x{ xsh }  @  k{ ksh }  -> shift={sh}  act={act}")
 
     # for recording purposes, fc1 in the toy golden example
     # is_relu = True
@@ -84,31 +94,64 @@ def golden_fc(x, k, is_relu, shift):
    
 
 if __name__ == "__main__":
-    
-    ################################################## PYTHON REFERENCE ##################################################  
+    ################################################## PYTHON REFERENCE ##################################################
     layers = []
-    # particle accelerator dim
-    in_particles, num_feature, num_feature_pad, ff_dim = 150, 3, 32, 64
-    # golden dense layer dim
-    m1, k1, n1, m2, k2, n2, m3, k3, n3 = 16, 32, 32, 16, 32, 64, 16, 64, 32 # matmul goes m * k * n
+    out_dim = 5
 
-    # dense layer to get to MHA 1 
-    dummy_inp = np.random.randint(0, 128, size=(in_particles, num_feature), dtype=np.int8)
-    pad_inp = np.zeroes((in_particles, num_feature_pad), dtype=np.int8)
-    pad_inp[:, :num_feature] = dummy_inp; 
+    # Keras-like dims
+    in_particles, num_feature, ff_dim = 150, 3, 64
+    num_feature_pad = 32   # pad to multiple of 8 for AIE tiling
 
-    a1, layer_fc1 = golden_fc(pad_inp, np.random.randint(0, 128, size=(k2, n2), dtype=np.int8), True, 3) # n2 matches ff_dim, k2 matches padding
-    
-    layers += layer_fc1
+    ###################################################################### below is layer 1
+    # ---- Input + padding (3 -> 32) ----
+    dummy_inp = np.random.randint(-128, 128, size=(in_particles, num_feature), dtype=np.int8)
+    pad_inp   = np.zeros((in_particles, num_feature_pad), dtype=np.int8)
+    pad_inp[:, :num_feature] = dummy_inp
 
-    from utils.np_mha_linear import NumpyMHALinear, residual_add_int8
-    import numpy as np
+    # ---- Dense to reach MHA width: (150,32) · (32,64) -> (150,64) ----
+    W_fc1 = np.random.randint(-128, 128, size=(num_feature_pad, ff_dim), dtype=np.int8)
+    a1, L1 = golden_fc(pad_inp, W_fc1, is_relu=True, shift=3)
+    layers += L1
+
+    # ---- MHA 1 + residual ----
     numheads = 4
     mha1 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha1", seed=0)
-    att1 = mha1(a1, a1, a1, layers=layers)       # like: MHA(...)(emb, emb, emb)
-    a2 = residual_add_int8(att1, a1)
+    att1 = mha1(a1, a1, a1, layers=layers)      # self-attention: Q=K=V=a1
+    a2   = residual_add_int8(att1, a1)          # Add()([x, emb])
 
+    ###################################################################### below is layer 2
+    # ---- Two dense (FF) + residual (Block 1) ----
+    W_ff1a = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    h1, L2a = golden_fc(a2, W_ff1a, is_relu=True, shift=3); layers += L2a
 
+    W_ff1b = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    h2, L2b = golden_fc(h1, W_ff1b, is_relu=True, shift=3); layers += L2b
+
+    lo1 = residual_add_int8(h2, a2)
+
+    # ---- MHA 2 + residual ----
+    mha2 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha2", seed=1)
+    att2 = mha2(lo1, lo1, lo1, layers=layers)
+    a3   = residual_add_int8(att2, lo1)
+    ####################################################################### below is layer 3
+    # ---- Two dense (FF) + residual (Block 2) ----
+    W_ff2a = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    h3, L3a = golden_fc(a3, W_ff2a, is_relu=True, shift=3); layers += L3a
+
+    W_ff2b = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    h4, L3b = golden_fc(h3, W_ff2b, is_relu=True, shift=3); layers += L3b
+
+    lo2 = residual_add_int8(h4, a3)
+
+    
+    ####################################################################### below is layer 4 - out
+    # ---- “Pooling” skipped (as you noted). Two final dense to 5 logits ----
+    # pooling:     x = keras.layers.GlobalAveragePooling1D(data_format='channels_last')(lo2)
+    W_out1 = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    z,  L4a = golden_fc(lo2, W_out1, is_relu=True,  shift=3); layers += L4a
+
+    W_out2 = np.random.randint(-128, 128, size=(ff_dim, out_dim), dtype=np.int8)
+    out, L4b = golden_fc(z, W_out2, is_relu=False, shift=3); layers += L4b
 
     ################################################## PYTHON REFERENCE END #################################################  
 

@@ -133,6 +133,7 @@ class NumpyMHALinear:
         ctx2d = ctx.reshape(BT, C)  # int8
         out_proj, sh_o = _quantize_gemm(ctx2d, self.Wo)
 
+        # for debug
         if layers is not None:
             layers.append({'name': f'{self.name}_Wo', 'x': ctx2d, 'k': self.Wo,
                            'y': out_proj, 'a': out_proj, 'shift': sh_o, 'is_relu': False})
