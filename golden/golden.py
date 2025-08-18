@@ -10,7 +10,16 @@ def tile_matrix(matrix, row_tiles, col_tiles): # (R,C) -> (R/r, C/c, r, c).flatt
     transposed = reshaped.transpose(0, 2, 1, 3) # (R/r, C/c, r, c)
     return transposed.flatten()
 
-def process_layer(idx, layer, m, k, n, iterations):
+def process_layer(idx, layer, m, k, n, iterations, graph_cpp_content=None):
+    """Process a layer: generate graph.cpp code and write weights/data files.
+    
+    Args:
+        idx: Layer index
+        layer: Layer dictionary with type, x, a, config, etc.
+        m, k, n: Tiling parameters
+        iterations: Number of iterations
+        graph_cpp_content: Optional list to append graph.cpp code to
+    """
     layer_type = layer['type']
     
     if layer_type == 'dense':
@@ -31,30 +40,26 @@ def process_layer(idx, layer, m, k, n, iterations):
         a_tiled = tile_matrix(layer["a"], m, n)
         np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
         np.savetxt(f"data/a{idx}.txt", np.tile(a_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
-
-        # model.cc - each layer as function
-        t_m = layer['x'].shape[0] // m
-        t_k = layer['x'].shape[1] // k
-        t_n = k_matrix.shape[1] // n
-        is_relu_str = str(is_relu).lower()
-
-        # layer_graph.h - create and connect layers
-        num_bytes = layer['x'].size * layer['x'].itemsize
-        in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
-
+        
         # Calculate tiling parameters
         t_m = layer['x'].shape[0] // m
         t_k = layer['x'].shape[1] // k
         t_n = k_matrix.shape[1] // n
-
-        with open("aie/layer_graph.h", "a") as f:
-            if layer_type == 'dense':
-                f.write(f"// Create DenseGraph for layer {idx}\n")
-                f.write(f"DenseGraph<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu_str}> ")
-                f.write(f"dense_graph_{idx}(k{idx});\n")
-                f.write(f"layers[{idx}] = &dense_graph_{idx};\n")
-                f.write(f"connect<window<{num_bytes:>5}>>({in_port}.out[0], dense_graph_{idx}.in);\n\n")
-            # Dense layer processing ends here
+        is_relu_str = str(is_relu).lower()
+        
+        # Generate code for graph.cpp if requested
+        if graph_cpp_content is not None:
+            graph_cpp_content.append(f"    // Dense graph for layer {idx}")
+            graph_cpp_content.append(f"    DenseGraph<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu_str}> dense_graph_{idx}(k{idx});")
+            graph_cpp_content.append(f"    layers[{idx}] = &dense_graph_{idx};")
+            
+            # Connect input
+            num_bytes = layer['x'].size * layer['x'].itemsize
+            if idx == 0:
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], dense_graph_{idx}.in);")
+            else:
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(layers[{idx-1}]->out[0], dense_graph_{idx}.in);")
+            graph_cpp_content.append("")
             
     elif layer_type == 'residual':
         # Extract input and residual tensors
@@ -77,25 +82,27 @@ def process_layer(idx, layer, m, k, n, iterations):
         if residual_idx is None:
             raise ValueError(f"Could not find source layer for residual connection in layer {idx}")
         
-        # layer_graph.h - create and connect layers
-        num_bytes = x.size * x.itemsize
-        in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
-        residual_port = f"layers[{residual_idx}]"
-        
         # Calculate tiling parameters for residual
         t_m = x.shape[0] // m
         t_n = x.shape[1] // n
         
-        with open("aie/layer_graph.h", "a") as f:
-            f.write(f"// Create ResidualGraph for layer {idx} with residual from layer {residual_idx}\n")
-            f.write(f"ResidualGraph<{m}, {n}, {t_m}, {t_n}> ")
-            f.write(f"residual_graph_{idx};\n")
-            f.write(f"layers[{idx}] = &residual_graph_{idx};\n")
-            f.write(f"connect<window<{num_bytes:>5}>>({in_port}.out[0], residual_graph_{idx}.in[0]);\n")
+        # Generate code for graph.cpp if requested
+        if graph_cpp_content is not None:
+            graph_cpp_content.append(f"    // Residual graph for layer {idx} with residual from layer {residual_idx}")
+            graph_cpp_content.append(f"    ResidualGraph<{m}, {n}, {t_m}, {t_n}> residual_graph_{idx};")
+            graph_cpp_content.append(f"    layers[{idx}] = &residual_graph_{idx};")
+            
+            # Connect inputs
+            num_bytes = x.size * x.itemsize
+            if idx == 0:
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], residual_graph_{idx}.in1);")
+            else:
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(layers[{idx-1}]->out[0], residual_graph_{idx}.in1);")
             
             # Connect residual input
             residual_bytes = residual.size * residual.itemsize
-            f.write(f"connect<window<{residual_bytes:>5}>>({residual_port}.out[0], residual_graph_{idx}.in[1]);\n\n")
+            graph_cpp_content.append(f"    connect<window<{residual_bytes:>5}>>(layers[{residual_idx}]->out[0], residual_graph_{idx}.in2);")
+            graph_cpp_content.append("")
     
     elif layer_type == 'mha':
         # Extract config parameters
@@ -118,9 +125,9 @@ def process_layer(idx, layer, m, k, n, iterations):
         shift_c = config['shift_c']
         
         # Extract tiling parameters if available
-        m = config.get('m', m)
-        k = config.get('k', k)
-        n = config.get('n', n)
+        m_local = config.get('m', m)
+        k_local = config.get('k', k)
+        n_local = config.get('n', n)
         
         # Generate weights files for all matrices
         for name, matrix in [
@@ -152,24 +159,80 @@ def process_layer(idx, layer, m, k, n, iterations):
         t_k = layer['x'].shape[1] // k
         t_n = d_model // n
         
-        # Declare MHAGraph in layer_graph.h
-        with open("aie/layer_graph.h", "a") as f:
+        # Generate code for graph.cpp if requested
+        if graph_cpp_content is not None:
+            graph_cpp_content.append(f"    // MHA graph for layer {idx}")
+            graph_cpp_content.append(f"    MHAGraph<{m}, {k}, {n}, {num_heads}, {d_model}, {shift_q}, {shift_k}, {shift_v}, {shift_o}, {shift_s}, {shift_c}> mha_graph_{idx}(Wq{idx}, Wk{idx}, Wv{idx}, Wo{idx});")
+            graph_cpp_content.append(f"    layers[{idx}] = &mha_graph_{idx};")
+            
+            # Connect input
             num_bytes = layer['x'].size * layer['x'].itemsize
-            in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
-            
-            # Create MHAGraph instance
-            f.write(f"// Create MHAGraph for layer {idx}\n")
-            f.write(f"MHAGraph<{m}, {k}, {n}, {num_heads}, {d_model}, {shift_q}, {shift_k}, {shift_v}, {shift_o}, {shift_s}, {shift_c}> ")
-            f.write(f"mha_graph_{idx}(Wq{idx}, Wk{idx}, Wv{idx}, Wo{idx});\n")
-            
-            # Store in layers array
-            f.write(f"layers[{idx}] = &mha_graph_{idx};\n")
-            
-            # Connect input to MHAGraph input port
-            f.write(f"connect<window<{num_bytes:>5}>>({in_port}.out[0], mha_graph_{idx}.in);\n\n")
-        
+            if idx == 0:
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], mha_graph_{idx}.in);")
+            else:
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(layers[{idx-1}]->out[0], mha_graph_{idx}.in);")
+            graph_cpp_content.append("")
+    
     else:
         raise ValueError(f"Unknown layer type: {layer_type}")
+
+def generate_graph_cpp(layers, m, k, n, iterations):
+    """Generate the complete graph.cpp file content and process all layers.
+    """
+    # Start with includes and class definition
+    graph_cpp_content = [
+        "#include <adf.h>",
+        "#include \"include.h\"",
+        "#include <vector>",
+        "#include \"model.h\"",
+        "#include \"dense_graph.h\"",
+        "#include \"mha_graph.h\"",
+        "#include \"residual_graph.h\"",
+        "#include \"weights.h\"",
+        "",
+        "using namespace adf;",
+        "",
+        "class mainGraph : public adf::graph {",
+        "private:",
+        "  graph* layers [N_LAYERS];",
+        "",
+        "public:",
+        "  input_plio  AIE_IN;",
+        "  output_plio AIE_OUT;",
+        "",
+        "  mainGraph(){",
+        "",
+        "    AIE_IN = input_plio::create(plio_128_bits, \"data/x0.txt\");",
+        "    AIE_OUT = output_plio::create(plio_128_bits, \"data/out_sim.txt\");",
+        ""
+    ]
+    
+    # Process each layer
+    for i, layer in enumerate(layers):
+        process_layer(i, layer, m, k, n, iterations, graph_cpp_content)
+    
+    # Connect the last layer to output
+    graph_cpp_content.append(f"    // Connect last layer to output")
+    graph_cpp_content.append(f"    connect<window<{layers[-1]['a'].size * layers[-1]['a'].itemsize:>5}>>(layers[{len(layers)-1}]->out[0], AIE_OUT.in[0]);")
+    
+    # Close the class and add main function
+    graph_cpp_content.extend([
+        "  }",
+        "};",
+        "",
+        "mainGraph mygraph;",
+        "",
+        "int main(void) {",
+        "  mygraph.init();",
+        "  mygraph.run(ITERATIONS);",
+        "  mygraph.end();",
+        "  return 0;",
+        "}",
+        ""
+    ])
+    
+    return "\n".join(graph_cpp_content)
+
 
 def print_layers_brief(layers):
     for i, L in enumerate(layers):
@@ -285,7 +348,7 @@ if __name__ == "__main__":
     # 0. Do a cleanup
 
     for path in [
-        "data", "aie/include.h", "aie/weights.h", "aie/layer_graph.h", "aie/model.cc", "aie/model.h",
+        "data", "aie/graph.cpp", "aie/include.h", "aie/weights.h", "aie/layer_graph.h", "aie/model.cc", "aie/model.h",
         "*.log", "aiesimulator_output", "Work", ".Xil", 
         ".AIE_SIM_CMD_LINE_OPTIONS", "ISS_RPC_SERVER_PORT",
         "libadf.a", "Map_Report.csv", "pl_sample_counts",
@@ -302,39 +365,29 @@ if __name__ == "__main__":
     os.makedirs("data", exist_ok=True)
     os.makedirs("aie", exist_ok=True)
 
-    # 1. include.h - common parameters
-    
+    # 1. Initialize include.h with common parameters
     with open("aie/include.h", "w") as f:
         f.write(f'#define N_LAYERS {len(layers)}\n#define ITERATIONS {iterations}')
         
-    # 2. Initialize layer_graph.h with necessary includes and declarations
-    
-    with open("aie/layer_graph.h", "w") as f:
-        f.write("// Auto-generated layer graph file\n")
-        f.write("#include \"dense_graph.h\"\n")
-        f.write("#include \"mha_graph.h\"\n")
-        f.write("#include \"residual_graph.h\"\n")
-        f.write("#include \"weights.h\"\n\n")
+    # 2. Initialize weights.h file with header
+    with open("aie/weights.h", "w") as f:
+        f.write("// Auto-generated weights for AIE implementation\n")
+        f.write("#pragma once\n\n")
 
-    # 3. Process each layer: write weights.h, x.txt, a.txt, model.cc, model.h, layer_graph.h
-
-    for i, layer in enumerate(layers):
-        process_layer(i, layer, m, k, n, iterations)
+    # 3. Generate graph.cpp file directly
+    # This also processes each layer and writes weights/data files in a single pass
+    graph_cpp_content = generate_graph_cpp(layers, m, k, n, iterations)
+    with open("aie/graph.cpp", "w") as f:
+        f.write(graph_cpp_content)
+        
+    # 4. Write reference output for verification
+    np.savetxt("data/out_ref.txt", layers[-1]['a'], fmt="%d")
     
-    tiled_mat = tile_matrix(layers[-1]['a'], m, n)
-    np.savetxt("data/out_ref.txt", np.tile(tiled_mat, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
-
-    # 4. Postamble of layer_graph.h - connect last layer to AIE_OUT
-    
-    with open("aie/layer_graph.h", "a") as f:
-        f.write(f"connect<window<{layers[-1]['a'].size * layers[-1]['a'].itemsize:>5}>>(layers[{len(layers)-1}].out[0], AIE_OUT.in[0]);\n")
-    
-
-    # 5. Run AIE
+    # 4. Run AIE
 
     subprocess.run(["./run.sh"], check=True)
 
-    # 6. Verify output
+    # 5. Verify output
 
     aie_out_path = "aiesimulator_output/data/out_sim.txt"
     assert os.path.exists(aie_out_path), f"Error: Output file {aie_out_path} does not exist."
@@ -353,3 +406,4 @@ if __name__ == "__main__":
         print("\n\nError: Output does not match\n")
         print(f"Simulation Output ({out_sim.shape}):\n{out_sim}\n")
         print(f"Expected output ({out_ref.shape}):\n{out_ref}\n")
+    

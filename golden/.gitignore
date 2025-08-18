@@ -18,3 +18,4 @@ aie/layer_graph.h
 aie/model.cc 
 aie/model.h
 golden_debug.ipynb
+aie/graph.cpp
