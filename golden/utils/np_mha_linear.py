@@ -1,10 +1,46 @@
 # np_mha_linear.py
 import numpy as np
 
-def residual_add_int8(x_int8, skip_int8):
-    """Keras Add()([x, skip]) with int8 saturation."""
+def residual_add_int8(x_int8, skip_int8, layers=None, m=2, n=8):
+    """Keras Add()([x, skip]) with int8 saturation.
+    
+    Args:
+        x_int8: Main input tensor (int8)
+        skip_int8: Residual/skip connection tensor (int8)
+        layers: Optional list to record layer information for AIE implementation
+        m, n: Tiling parameters for AIE implementation
+    
+    Returns:
+        int8 tensor with the result of x_int8 + skip_int8 with saturation
+    """
+    # Compute the result
     y = x_int8.astype(np.int16) + skip_int8.astype(np.int16)
     y = np.clip(y, -128, 127).astype(np.int8)
+    
+    # Record layer information if requested
+    if layers is not None:
+        # Get tensor dimensions
+        if len(x_int8.shape) == 2:
+            Tm, Tn = x_int8.shape[0] // m, x_int8.shape[1] // n
+        else:
+            # Handle 3D tensors (batch, seq_len, features)
+            Tm, Tn = x_int8.shape[1] // m, x_int8.shape[2] // n
+            
+        # Create layer record
+        layer = {
+            'type': 'residual',
+            'x': x_int8,
+            'residual': skip_int8,
+            'a': y,
+            'config': {
+                'm': m,
+                'n': n,
+                'Tm': Tm,
+                'Tn': Tn
+            }
+        }
+        layers.append(layer)
+    
     return y
 
 def _choose_shift(acc_int32):

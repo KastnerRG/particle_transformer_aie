@@ -179,4 +179,40 @@ void output_kernel(
   }
 }
 
-#endif
+// Residual addition kernel - adds two int8 tensors with saturation
+template <int m, int n, int Tm, int Tn>
+void residual_add_kernel(
+  input_window_int8* __restrict input1,
+  input_window_int8* __restrict input2,
+  output_window_int8* __restrict output
+) {
+  // Get pointers
+  const int8* __restrict pInput1 = (int8*)input1->ptr;
+  const int8* __restrict pInput2 = (int8*)input2->ptr;
+  int8* __restrict pOutput = (int8*)output->ptr;
+  
+  // For profiling only
+  unsigned long long cycle_num[2];
+  aie::tile tile = aie::tile::current();
+  cycle_num[0] = tile.cycles();
+  
+  // Process all elements
+  const int total_elements = Tm * m * Tn * n;
+  
+  for (int i = 0; i < total_elements; i++) {
+    // Add with int16 precision to avoid overflow
+    int16_t sum = (int16_t)pInput1[i] + (int16_t)pInput2[i];
+    
+    // Saturate to int8 range
+    if (sum > 127) sum = 127;
+    if (sum < -128) sum = -128;
+    
+    // Store result
+    pOutput[i] = (int8_t)sum;
+  }
+  
+  // For profiling only
+  cycle_num[1] = tile.cycles();
+  printf("residual_add: start=%lld,end=%lld,total=%lld\n", 
+         cycle_num[0], cycle_num[1], cycle_num[1] - cycle_num[0]);
+}

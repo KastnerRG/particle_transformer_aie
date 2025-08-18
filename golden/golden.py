@@ -56,13 +56,55 @@ def process_layer(idx, layer, m, k, n, iterations):
         t_n = k_matrix.shape[1] // n
 
         with open("aie/layer_graph.h", "a") as f:
-            f.write(f"// Create DenseGraph for layer {idx}\n")
-            f.write(f"DenseGraph<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu_str}> ")
-            f.write(f"dense_graph_{idx}(k{idx});\n")
-            f.write(f"layers[{idx}] = &dense_graph_{idx};\n")
-            f.write(f"connect<window<{num_bytes:>5}>>({in_port}.out[0], dense_graph_{idx}.in);\n\n")
+            if layer_type == 'dense':
+                f.write(f"// Create DenseGraph for layer {idx}\n")
+                f.write(f"DenseGraph<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu_str}> ")
+                f.write(f"dense_graph_{idx}(k{idx});\n")
+                f.write(f"layers[{idx}] = &dense_graph_{idx};\n")
+                f.write(f"connect<window<{num_bytes:>5}>>({in_port}.out[0], dense_graph_{idx}.in);\n\n")
+            # Dense layer processing ends here
             
+    elif layer_type == 'residual':
+        # Extract input and residual tensors
+        x = layer['x']
+        residual = layer['residual']
+        
+        # Save input/output data for testing
+        x_tiled = tile_matrix(x, m, n)  # Using m,n since both tensors should have same shape
+        a_tiled = tile_matrix(layer["a"], m, n)
+        np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
+        np.savetxt(f"data/a{idx}.txt", np.tile(a_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
+        
+        # Find the previous layer that produced the residual input
+        residual_idx = None
+        for i in range(idx):
+            if i < len(layers) and np.array_equal(layers[i]['a'], residual):
+                residual_idx = i
+                break
+        
+        if residual_idx is None:
+            raise ValueError(f"Could not find source layer for residual connection in layer {idx}")
+        
+        # layer_graph.h - create and connect layers
+        num_bytes = x.size * x.itemsize
+        in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
+        residual_port = f"layers[{residual_idx}]"
+        
+        # Calculate tiling parameters for residual
+        t_m = x.shape[0] // m
+        t_n = x.shape[1] // n
+        
+        with open("aie/layer_graph.h", "a") as f:
+            f.write(f"// Create ResidualGraph for layer {idx} with residual from layer {residual_idx}\n")
+            f.write(f"ResidualGraph<{m}, {n}, {t_m}, {t_n}> ")
+            f.write(f"residual_graph_{idx};\n")
+            f.write(f"layers[{idx}] = &residual_graph_{idx};\n")
+            f.write(f"connect<window<{num_bytes:>5}>>({in_port}.out[0], residual_graph_{idx}.in[0]);\n")
             
+            # Connect residual input
+            residual_bytes = residual.size * residual.itemsize
+            f.write(f"connect<window<{residual_bytes:>5}>>({residual_port}.out[0], residual_graph_{idx}.in[1]);\n\n")
+    
     elif layer_type == 'mha':
         # Extract config parameters
         config = layer['config']
@@ -152,41 +194,29 @@ def print_layers_brief(layers):
         elif layer_type == 'mha':
             config = L['config']
             print(f"{i:02d} {name:12s}  x{ xsh }  @ MHA layer")
+        elif layer_type == 'residual':
+            residual_shape = tuple(L['residual'].shape)
+            print(f"{i:02d} {name:12s}  x{ xsh }  +  residual{ residual_shape }")
         else:
             print(f"{i:02d} {name:12s}  x{ xsh }  @ Unknown layer type: {layer_type}")
 
 
-    # for recording purposes, fc1 in the toy golden example
-    # is_relu = True
-    # shift = 2
-    # x = np.random.randint(0, 128, size=(16, 32), dtype=np.int8)
-    # k = np.random.randint(0, 128, size=(32, 32), dtype=np.int8)
-
-    # fc2 in the toy golden example
-#    is_relu = False
-#    shift = 3
-#    x = a
-#    k = np.random.randint(0, 128, size=(32, 64), dtype=np.int8)
-#    y = np.matmul(x.astype(np.int32), k.astype(np.int32))
-#    y = (y >> shift).astype(np.int8)
-#    a = np.maximum(0, y) if is_relu else y
-#    layers += [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
-
-    # fc3 in the original toy golden example
-#    is_relu = True
-#    shift = 4
-#    x = a
-#    k = np.random.randint(0, 128, size=(64, 32), dtype=np.int8)
-#    y = np.matmul(x.astype(np.int32), k.astype(np.int32))
-#    y = (y >> shift).astype(np.int8)
-#    a = np.maximum(0, y) if is_relu else y
-#    layers += [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
-
-
 def golden_fc(x, k, is_relu, shift):
+    """Perform dense (fully connected) operation with int8 quantization.
+    
+    Args:
+        x: Input tensor (int8)
+        k: Weight matrix (int8)
+        is_relu: Whether to apply ReLU activation
+        shift: Right shift amount for quantization
+        
+    Returns:
+        Tuple of (output tensor, layer info)
+    """
     y = np.matmul(x.astype(np.int32), k.astype(np.int32))
     y = (y >> shift).astype(np.int8)
     a = np.maximum(0, y) if is_relu else y
+    
     layer_fc = [{
         'type': 'dense',
         'x': x,
@@ -225,7 +255,7 @@ if __name__ == "__main__":
     numheads = 4
     mha1 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha1", seed=0)
     att1 = mha1(a1, a1, a1, layers=layers)      # self-attention: Q=K=V=a1
-    a2   = residual_add_int8(att1, a1)          # Add()([x, emb])
+    a2   = residual_add_int8(att1, a1, layers=layers)  # Add()([x, emb])
 
     ###################################################################### below is layer 2
     # ---- Two dense (FF) + residual (Block 1) ----
@@ -234,13 +264,13 @@ if __name__ == "__main__":
 
     W_ff1b = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
     h2, L2b = golden_fc(h1, W_ff1b, is_relu=True, shift=3); layers += L2b
-
-    lo1 = residual_add_int8(h2, a2)
+    # Apply residual connection separately
+    lo1 = residual_add_int8(h2, a2, layers=layers)
 
     # ---- MHA 2 + residual ----
     mha2 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha2", seed=1)
     att2 = mha2(lo1, lo1, lo1, layers=layers)
-    a3   = residual_add_int8(att2, lo1)
+    a3   = residual_add_int8(att2, lo1, layers=layers)
     ####################################################################### below is layer 3
     # ---- Two dense (FF) + residual (Block 2) ----
     W_ff2a = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
@@ -248,8 +278,8 @@ if __name__ == "__main__":
 
     W_ff2b = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
     h4, L3b = golden_fc(h3, W_ff2b, is_relu=True, shift=3); layers += L3b
-
-    lo2 = residual_add_int8(h4, a3)
+    # Apply residual connection separately
+    lo2 = residual_add_int8(h4, a3, layers=layers)
 
     
     ####################################################################### below is layer 4 - out
@@ -293,12 +323,6 @@ if __name__ == "__main__":
     
     with open("aie/include.h", "w") as f:
         f.write(f'#define N_LAYERS {len(layers)}\n#define ITERATIONS {iterations}')
-    """
-    # 2. Preamble of model.cc - each layer as function
-
-    with open("aie/model.cc", "w") as f:
-        f.write('#include "kernels.h"\n#include "weights.h"\n#include "mha_graph.h"\n#include "dense_graph.h"\n')
-    """
 
     # 3. Process each layer: write weights.h, x.txt, a.txt, model.cc, model.h, layer_graph.h
 
