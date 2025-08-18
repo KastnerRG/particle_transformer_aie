@@ -37,15 +37,7 @@ def process_layer(idx, layer, m, k, n, iterations):
         t_k = layer['x'].shape[1] // k
         t_n = k_matrix.shape[1] // n
         is_relu_str = str(is_relu).lower()
-        """
-        with open("aie/model.cc", "a") as f:
-            f.write(f"void f{idx}(input_window_int8* __restrict x, output_window_int8 * __restrict a) ")
-            f.write(f"{{ dense<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu_str}> (x, a, k{idx}); }}\n")
-        
-        # model.h - Function prototypes
-        with open("aie/model.h", "a") as f:
-            f.write(f"void f{idx}( input_window_int8  * __restrict, output_window_int8 * __restrict);\n")
-        """
+
         # layer_graph.h - create and connect layers
         num_bytes = layer['x'].size * layer['x'].itemsize
         in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
@@ -203,15 +195,6 @@ def print_layers_brief(layers):
 
 def golden_fc(x, k, is_relu, shift):
     """Perform dense (fully connected) operation with int8 quantization.
-    
-    Args:
-        x: Input tensor (int8)
-        k: Weight matrix (int8)
-        is_relu: Whether to apply ReLU activation
-        shift: Right shift amount for quantization
-        
-    Returns:
-        Tuple of (output tensor, layer info)
     """
     y = np.matmul(x.astype(np.int32), k.astype(np.int32))
     y = (y >> shift).astype(np.int8)
@@ -323,6 +306,15 @@ if __name__ == "__main__":
     
     with open("aie/include.h", "w") as f:
         f.write(f'#define N_LAYERS {len(layers)}\n#define ITERATIONS {iterations}')
+        
+    # 2. Initialize layer_graph.h with necessary includes and declarations
+    
+    with open("aie/layer_graph.h", "w") as f:
+        f.write("// Auto-generated layer graph file\n")
+        f.write("#include \"dense_graph.h\"\n")
+        f.write("#include \"mha_graph.h\"\n")
+        f.write("#include \"residual_graph.h\"\n")
+        f.write("#include \"weights.h\"\n\n")
 
     # 3. Process each layer: write weights.h, x.txt, a.txt, model.cc, model.h, layer_graph.h
 
@@ -337,7 +329,7 @@ if __name__ == "__main__":
     with open("aie/layer_graph.h", "a") as f:
         f.write(f"connect<window<{layers[-1]['a'].size * layers[-1]['a'].itemsize:>5}>>(layers[{len(layers)-1}].out[0], AIE_OUT.in[0]);\n")
     
-"""
+
     # 5. Run AIE
 
     subprocess.run(["./run.sh"], check=True)
@@ -361,4 +353,3 @@ if __name__ == "__main__":
         print("\n\nError: Output does not match\n")
         print(f"Simulation Output ({out_sim.shape}):\n{out_sim}\n")
         print(f"Expected output ({out_ref.shape}):\n{out_ref}\n")
-"""
