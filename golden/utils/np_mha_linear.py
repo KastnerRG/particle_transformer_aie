@@ -41,12 +41,15 @@ class NumpyMHALinear:
     - Set `name_prefix` to get entries like mha1_Wq, mha1_Wk, ...
     """
     def __init__(self, d_model, num_heads=4, name_prefix="mha1", seed=0,
-                 Wq=None, Wk=None, Wv=None, Wo=None):
+                 Wq=None, Wk=None, Wv=None, Wo=None, m=2, k=8, n=8):
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
         self.C = d_model
         self.H = num_heads
         self.dh = d_model // num_heads
         self.name = str(name_prefix)
+        self.m = m  # Tiling parameter for AIE implementation
+        self.k = k  # Tiling parameter for AIE implementation
+        self.n = n  # Tiling parameter for AIE implementation
         rng = np.random.default_rng(seed)
 
         def initW():
@@ -54,7 +57,7 @@ class NumpyMHALinear:
 
         self.Wq = Wq if Wq is not None else initW()
         self.Wk = Wk if Wk is not None else initW()
-        self.Wv = V if (V:=Wv) is not None else initW()  # small trick to keep name short
+        self.Wv = Wv if Wv is not None else initW()  # Fixed the variable name
         self.Wo = Wo if Wo is not None else initW()
 
     def __call__(self, q, k=None, v=None, layers=None, training=False):
@@ -87,14 +90,6 @@ class NumpyMHALinear:
         k_proj, sh_k = _quantize_gemm(k2d, self.Wk)
         v_proj, sh_v = _quantize_gemm(v2d, self.Wv)
 
-        if layers is not None:
-            layers.append({'name': f'{self.name}_Wq', 'x': q2d, 'k': self.Wq,
-                           'y': q_proj, 'a': q_proj, 'shift': sh_q, 'is_relu': False})
-            layers.append({'name': f'{self.name}_Wk', 'x': k2d, 'k': self.Wk,
-                           'y': k_proj, 'a': k_proj, 'shift': sh_k, 'is_relu': False})
-            layers.append({'name': f'{self.name}_Wv', 'x': v2d, 'k': self.Wv,
-                           'y': v_proj, 'a': v_proj, 'shift': sh_v, 'is_relu': False})
-
         qh = q_proj.reshape(B, T, self.H, self.dh).transpose(0, 2, 1, 3)  # (B,H,T,dh)
         kh = k_proj.reshape(B, T, self.H, self.dh).transpose(0, 2, 1, 3)
         vh = v_proj.reshape(B, T, self.H, self.dh).transpose(0, 2, 1, 3)
@@ -107,12 +102,6 @@ class NumpyMHALinear:
                 Q = qh[b, h].astype(np.int32)              # (T,dh)
                 Kt = kh[b, h].astype(np.int32).T           # (dh,T)
                 scores_acc = Q @ Kt                         # (T,T) int32
-
-                # # NONLINEAR (commented): scaling and softmax
-                # # scale = 1.0 / math.sqrt(self.dh)     # float
-                # # scores = scores_acc * scale
-                # # attn = softmax(scores, axis=-1)      # non-linear
-                # # if training and dropout>0: apply dropout mask
 
                 # Quantize scores to int8
                 sh_s = _choose_shift(scores_acc)
@@ -133,10 +122,9 @@ class NumpyMHALinear:
         ctx2d = ctx.reshape(BT, C)  # int8
         out_proj, sh_o = _quantize_gemm(ctx2d, self.Wo)
 
-        # for debug
+        # Add complete MHA layer for AIE build
         if layers is not None:
-            layers.append({'name': f'{self.name}_Wo', 'x': ctx2d, 'k': self.Wo,
-                           'y': out_proj, 'a': out_proj, 'shift': sh_o, 'is_relu': False})
+            layers.append({'type': 'mha', 'name': f'{self.name}', 'x': q2d, 'a': out_proj, 'config': {'Wq': self.Wq, 'Wk': self.Wk, 'Wv': self.Wv, 'Wo': self.Wo, 'shift_q': sh_q, 'shift_k': sh_k, 'shift_v': sh_v, 'shift_o': sh_o, 'shift_s': sh_s, 'shift_c': sh_c, 'num_heads': self.H, 'd_model': self.C, 'm': self.m, 'k': self.k, 'n': self.n}})
 
         out = out_proj.reshape(B, T, C)  # int8
         return out[0] if squeezed else out
