@@ -41,11 +41,11 @@ def process_layer(idx, layer, m, k, n, iterations):
         with open("aie/model.cc", "a") as f:
             f.write(f"void f{idx}(input_window_int8* __restrict x, output_window_int8 * __restrict a) ")
             f.write(f"{{ dense<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu_str}> (x, a, k{idx}); }}\n")
-        """
+        
         # model.h - Function prototypes
         with open("aie/model.h", "a") as f:
             f.write(f"void f{idx}( input_window_int8  * __restrict, output_window_int8 * __restrict);\n")
-
+        """
         # layer_graph.h - create and connect layers
         num_bytes = layer['x'].size * layer['x'].itemsize
         in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
@@ -293,12 +293,12 @@ if __name__ == "__main__":
     
     with open("aie/include.h", "w") as f:
         f.write(f'#define N_LAYERS {len(layers)}\n#define ITERATIONS {iterations}')
-
+    """
     # 2. Preamble of model.cc - each layer as function
 
     with open("aie/model.cc", "w") as f:
         f.write('#include "kernels.h"\n#include "weights.h"\n#include "mha_graph.h"\n#include "dense_graph.h"\n')
-
+    """
 
     # 3. Process each layer: write weights.h, x.txt, a.txt, model.cc, model.h, layer_graph.h
 
