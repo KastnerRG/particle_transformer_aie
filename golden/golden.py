@@ -10,7 +10,7 @@ def tile_matrix(matrix, row_tiles, col_tiles): # (R,C) -> (R/r, C/c, r, c).flatt
     transposed = reshaped.transpose(0, 2, 1, 3) # (R/r, C/c, r, c)
     return transposed.flatten()
 
-def process_layer(idx, layer, m, k, n, iterations, graph_cpp_content=None):
+def process_layer(idx, layer, m, k, n, iterations, graph_cpp_content=None, class_members=None, layer_connections=None):
     """Process a layer: generate graph.cpp code and write weights/data files.
     
     Args:
@@ -19,6 +19,8 @@ def process_layer(idx, layer, m, k, n, iterations, graph_cpp_content=None):
         m, k, n: Tiling parameters
         iterations: Number of iterations
         graph_cpp_content: Optional list to append graph.cpp code to
+        class_members: Optional list to append class member declarations
+        layer_connections: Optional list to append layer connection code
     """
     layer_type = layer['type']
     
@@ -49,17 +51,25 @@ def process_layer(idx, layer, m, k, n, iterations, graph_cpp_content=None):
         
         # Generate code for graph.cpp if requested
         if graph_cpp_content is not None:
-            graph_cpp_content.append(f"    // Dense graph for layer {idx}")
-            graph_cpp_content.append(f"    DenseGraph<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu_str}> dense_graph_{idx}(k{idx});")
-            graph_cpp_content.append(f"    layers[{idx}] = &dense_graph_{idx};")
+            # Add class member declaration
+            if class_members is not None:
+                class_members.append(f"  // Dense graph for layer {idx}")
+                class_members.append(f"  DenseGraph<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu_str}> dense_graph_{idx} {{ k{idx} }};")
             
-            # Connect input
-            num_bytes = layer['x'].size * layer['x'].itemsize
-            if idx == 0:
-                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], dense_graph_{idx}.in);")
-            else:
-                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(layers[{idx-1}]->out[0], dense_graph_{idx}.in);")
-            graph_cpp_content.append("")
+            # Add layer pointer assignment
+            graph_cpp_content.append(f"    // Assign layer {idx} pointer")
+            graph_cpp_content.append(f"    layers[{idx}] = &dense_graph_{idx};") 
+            
+            # Add connection code
+            if layer_connections is not None:
+                num_bytes = layer['x'].size * layer['x'].itemsize
+                if idx == 0:
+                    layer_connections.append(f"    // Connect input to first layer")
+                    layer_connections.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], dense_graph_{idx}.in);")
+                else:
+                    layer_connections.append(f"    // Connect layer {idx-1} to layer {idx}")
+                    layer_connections.append(f"    connect<window<{num_bytes:>5}>>(layers[{idx-1}]->out[0], dense_graph_{idx}.in);")
+                layer_connections.append("")
             
     elif layer_type == 'residual':
         # Extract input and residual tensors
@@ -88,21 +98,31 @@ def process_layer(idx, layer, m, k, n, iterations, graph_cpp_content=None):
         
         # Generate code for graph.cpp if requested
         if graph_cpp_content is not None:
-            graph_cpp_content.append(f"    // Residual graph for layer {idx} with residual from layer {residual_idx}")
-            graph_cpp_content.append(f"    ResidualGraph<{m}, {n}, {t_m}, {t_n}> residual_graph_{idx};")
-            graph_cpp_content.append(f"    layers[{idx}] = &residual_graph_{idx};")
+            # Add class member declaration
+            if class_members is not None:
+                class_members.append(f"  // Residual graph for layer {idx} with residual from layer {residual_idx}")
+                class_members.append(f"  ResidualGraph<{m}, {n}, {t_m}, {t_n}> residual_graph_{idx};") 
             
-            # Connect inputs
-            num_bytes = x.size * x.itemsize
-            if idx == 0:
-                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], residual_graph_{idx}.in1);")
-            else:
-                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(layers[{idx-1}]->out[0], residual_graph_{idx}.in1);")
+            # Add layer pointer assignment
+            graph_cpp_content.append(f"    // Assign layer {idx} pointer")
+            graph_cpp_content.append(f"    layers[{idx}] = &residual_graph_{idx};") 
             
-            # Connect residual input
-            residual_bytes = residual.size * residual.itemsize
-            graph_cpp_content.append(f"    connect<window<{residual_bytes:>5}>>(layers[{residual_idx}]->out[0], residual_graph_{idx}.in2);")
-            graph_cpp_content.append("")
+            # Add connection code
+            if layer_connections is not None:
+                # Connect main input
+                num_bytes = x.size * x.itemsize
+                if idx == 0:
+                    layer_connections.append(f"    // Connect input to first layer")
+                    layer_connections.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], residual_graph_{idx}.in1);") 
+                else:
+                    layer_connections.append(f"    // Connect layer {idx-1} to layer {idx}")
+                    layer_connections.append(f"    connect<window<{num_bytes:>5}>>(layers[{idx-1}]->out[0], residual_graph_{idx}.in1);") 
+                
+                # Connect residual input
+                residual_bytes = residual.size * residual.itemsize
+                layer_connections.append(f"    // Connect residual from layer {residual_idx} to layer {idx}")
+                layer_connections.append(f"    connect<window<{residual_bytes:>5}>>(layers[{residual_idx}]->out[0], residual_graph_{idx}.in2);") 
+                layer_connections.append("")
     
     elif layer_type == 'mha':
         # Extract config parameters
@@ -161,23 +181,39 @@ def process_layer(idx, layer, m, k, n, iterations, graph_cpp_content=None):
         
         # Generate code for graph.cpp if requested
         if graph_cpp_content is not None:
-            graph_cpp_content.append(f"    // MHA graph for layer {idx}")
-            graph_cpp_content.append(f"    MHAGraph<{m}, {k}, {n}, {num_heads}, {d_model}, {shift_q}, {shift_k}, {shift_v}, {shift_o}, {shift_s}, {shift_c}> mha_graph_{idx}(Wq{idx}, Wk{idx}, Wv{idx}, Wo{idx});")
-            graph_cpp_content.append(f"    layers[{idx}] = &mha_graph_{idx};")
+            # Add class member declaration
+            if class_members is not None:
+                class_members.append(f"  // MHA graph for layer {idx}")
+                class_members.append(f"  MHAGraph<{m}, {k}, {n}, {num_heads}, {d_model}, {shift_q}, {shift_k}, {shift_v}, {shift_o}, {shift_s}, {shift_c}> mha_graph_{idx} {{ Wq{idx}, Wk{idx}, Wv{idx}, Wo{idx} }};")
             
-            # Connect input
-            num_bytes = layer['x'].size * layer['x'].itemsize
-            if idx == 0:
-                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], mha_graph_{idx}.in);")
-            else:
-                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(layers[{idx-1}]->out[0], mha_graph_{idx}.in);")
-            graph_cpp_content.append("")
+            # Add layer pointer assignment
+            graph_cpp_content.append(f"    // Assign layer {idx} pointer")
+            graph_cpp_content.append(f"    layers[{idx}] = &mha_graph_{idx};") 
+            
+            # Add connection code
+            if layer_connections is not None:
+                num_bytes = layer['x'].size * layer['x'].itemsize
+                if idx == 0:
+                    layer_connections.append(f"    // Connect input to first layer")
+                    layer_connections.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], mha_graph_{idx}.in);") 
+                else:
+                    layer_connections.append(f"    // Connect layer {idx-1} to layer {idx}")
+                    layer_connections.append(f"    connect<window<{num_bytes:>5}>>(layers[{idx-1}]->out[0], mha_graph_{idx}.in);") 
+                layer_connections.append("")
     
     else:
         raise ValueError(f"Unknown layer type: {layer_type}")
 
 def generate_graph_cpp(layers, m, k, n, iterations):
-    """Generate the complete graph.cpp file content and process all layers.
+    """Write input/output data files. Generate graph.cpp code
+    
+    Args:
+        layers: List of layer dictionaries
+        m, k, n: Tiling parameters
+        iterations: Number of iterations
+        
+    Returns:
+        String containing the complete graph.cpp file content
     """
     # Start with includes and class definition
     graph_cpp_content = [
@@ -193,23 +229,136 @@ def generate_graph_cpp(layers, m, k, n, iterations):
         "using namespace adf;",
         "",
         "class mainGraph : public adf::graph {",
-        "private:",
-        "  graph* layers [N_LAYERS];",
-        "",
-        "public:",
-        "  input_plio  AIE_IN;",
-        "  output_plio AIE_OUT;",
-        "",
-        "  mainGraph(){",
-        "",
-        "    AIE_IN = input_plio::create(plio_128_bits, \"data/x0.txt\");",
-        "    AIE_OUT = output_plio::create(plio_128_bits, \"data/out_sim.txt\");",
-        ""
+        "private:"
     ]
     
-    # Process each layer
+    # Class member declarations for graph objects
+    class_members = []
+    
+    # Process each layer to generate class member declarations
     for i, layer in enumerate(layers):
-        process_layer(i, layer, m, k, n, iterations, graph_cpp_content)
+        layer_type = layer['type']
+        
+        if layer_type == 'dense':
+            # Extract config parameters
+            config = layer['config']
+            k_matrix = config['k']
+            shift = config['shift']
+            is_relu = config['is_relu']
+            is_relu_str = str(is_relu).lower()
+            
+            # Calculate tiling parameters
+            t_m = layer['x'].shape[0] // m
+            t_k = layer['x'].shape[1] // k
+            t_n = k_matrix.shape[1] // n
+            
+            # Add class member declaration
+            class_members.append(f"  // Dense graph for layer {i}")
+            class_members.append(f"  DenseGraph<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu_str}> dense_graph_{i} {{ k{i} }};")
+            
+        elif layer_type == 'residual':
+            # Find residual source layer
+            residual_idx = None
+            for j in range(i):
+                if np.array_equal(layers[j]['a'], layer['residual']):
+                    residual_idx = j
+                    break
+            
+            if residual_idx is None:
+                raise ValueError(f"Could not find source layer for residual connection in layer {i}")
+            
+            # Calculate tiling parameters
+            t_m = layer['x'].shape[0] // m
+            t_n = layer['x'].shape[1] // n
+            
+            # Add class member declaration
+            class_members.append(f"  // Residual graph for layer {i} with residual from layer {residual_idx}")
+            class_members.append(f"  ResidualGraph<{m}, {n}, {t_m}, {t_n}> residual_graph_{i};") 
+            
+        elif layer_type == 'mha':
+            # Extract config parameters
+            config = layer['config']
+            num_heads = config['num_heads']
+            d_model = config['d_model']
+            shift_q = config['shift_q']
+            shift_k = config['shift_k']
+            shift_v = config['shift_v']
+            shift_o = config['shift_o']
+            shift_s = config['shift_s']
+            shift_c = config['shift_c']
+            
+            # Calculate tiling parameters
+            t_m = layer['x'].shape[0] // m
+            t_k = layer['x'].shape[1] // k
+            t_n = d_model // n
+            
+            # Add class member declaration
+            class_members.append(f"  // MHA graph for layer {i}")
+            class_members.append(f"  MHAGraph<{m}, {k}, {n}, {num_heads}, {d_model}, {shift_q}, {shift_k}, {shift_v}, {shift_o}, {shift_s}, {shift_c}> mha_graph_{i} {{ Wq{i}, Wk{i}, Wv{i}, Wo{i} }};")
+    
+    # Add layers array after graph declarations
+    graph_cpp_content.extend(class_members)
+    graph_cpp_content.append("  graph* layers [N_LAYERS];") 
+    graph_cpp_content.append("")
+    graph_cpp_content.append("public:")
+    graph_cpp_content.append("  input_plio  AIE_IN;")
+    graph_cpp_content.append("  output_plio AIE_OUT;")
+    graph_cpp_content.append("")
+    graph_cpp_content.append("  mainGraph(){")
+    graph_cpp_content.append("")
+    graph_cpp_content.append("    AIE_IN = input_plio::create(plio_128_bits, \"data/x0.txt\");")
+    graph_cpp_content.append("    AIE_OUT = output_plio::create(plio_128_bits, \"data/out_sim.txt\");")
+    graph_cpp_content.append("")
+    
+    # Process each layer - this will write weights.h and data files and add layer assignments
+    for i, layer in enumerate(layers):
+        # Process layer to write weights and data files
+        process_layer(i, layer, m, k, n, iterations)
+        
+        # Add layer pointer assignment
+        layer_type = layer['type']
+        if layer_type == 'dense':
+            graph_cpp_content.append(f"    // Assign layer {i} pointer")
+            graph_cpp_content.append(f"    layers[{i}] = &dense_graph_{i};") 
+        elif layer_type == 'residual':
+            graph_cpp_content.append(f"    // Assign layer {i} pointer")
+            graph_cpp_content.append(f"    layers[{i}] = &residual_graph_{i};") 
+        elif layer_type == 'mha':
+            graph_cpp_content.append(f"    // Assign layer {i} pointer")
+            graph_cpp_content.append(f"    layers[{i}] = &mha_graph_{i};") 
+        
+        # Add connection code
+        num_bytes = layer['x'].size * layer['x'].itemsize
+        if i == 0:
+            graph_cpp_content.append(f"    // Connect input to first layer")
+            if layer_type == 'dense':
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], dense_graph_{i}.in);") 
+            elif layer_type == 'residual':
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], residual_graph_{i}.in1);") 
+            elif layer_type == 'mha':
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(AIE_IN.out[0], mha_graph_{i}.in);") 
+        else:
+            graph_cpp_content.append(f"    // Connect layer {i-1} to layer {i}")
+            if layer_type == 'dense':
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(layers[{i-1}]->out[0], dense_graph_{i}.in);") 
+            elif layer_type == 'residual':
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(layers[{i-1}]->out[0], residual_graph_{i}.in1);") 
+                
+                # Find residual source layer
+                residual_idx = None
+                for j in range(i):
+                    if np.array_equal(layers[j]['a'], layer['residual']):
+                        residual_idx = j
+                        break
+                
+                # Connect residual input
+                residual_bytes = layer['residual'].size * layer['residual'].itemsize
+                graph_cpp_content.append(f"    // Connect residual from layer {residual_idx} to layer {i}")
+                graph_cpp_content.append(f"    connect<window<{residual_bytes:>5}>>(layers[{residual_idx}]->out[0], residual_graph_{i}.in2);") 
+            elif layer_type == 'mha':
+                graph_cpp_content.append(f"    connect<window<{num_bytes:>5}>>(layers[{i-1}]->out[0], mha_graph_{i}.in);") 
+        
+        graph_cpp_content.append("")
     
     # Connect the last layer to output
     graph_cpp_content.append(f"    // Connect last layer to output")
@@ -382,7 +531,7 @@ if __name__ == "__main__":
         
     # 4. Write reference output for verification
     np.savetxt("data/out_ref.txt", layers[-1]['a'], fmt="%d")
-    
+    """
     # 4. Run AIE
 
     subprocess.run(["./run.sh"], check=True)
@@ -406,4 +555,4 @@ if __name__ == "__main__":
         print("\n\nError: Output does not match\n")
         print(f"Simulation Output ({out_sim.shape}):\n{out_sim}\n")
         print(f"Expected output ({out_ref.shape}):\n{out_ref}\n")
-    
+    """

@@ -8,8 +8,8 @@
 
 template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT, bool is_relu>
 void dense(
-  input_window_int8 * __restrict matA, 
-  output_window_int8 * __restrict matC,
+  adf::input_window_int8 * __restrict matA, 
+  adf::output_window_int8 * __restrict matC,
   const int8 matB []
   ){
   using MMUL = aie::mmul<m, k, n, int8, int8>;
