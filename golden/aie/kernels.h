@@ -216,3 +216,5 @@ void residual_add_kernel(
   printf("residual_add: start=%lld,end=%lld,total=%lld\n", 
          cycle_num[0], cycle_num[1], cycle_num[1] - cycle_num[0]);
 }
+
+#endif
