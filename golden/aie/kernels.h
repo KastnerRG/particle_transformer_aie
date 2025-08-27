@@ -13,7 +13,6 @@ void dense(
   const int8 matB []
   ){
   using MMUL = aie::mmul<m, k, n, int8, int8>;
-
   const int8* __restrict pA=(int8*)matA->ptr;
   const int8* __restrict pB=(int8*)matB;
   int8* __restrict pC = (int8*) matC->ptr;
@@ -22,12 +21,11 @@ void dense(
   unsigned long long cycle_num[2];
   aie::tile tile=aie::tile::current();
   cycle_num[0]=tile.cycles();
-
   for (unsigned im = 0; im < Tm; ++im) 
-  chess_unroll_loop(Tm)
+  //chess_unroll_loop(Tm)
   {
     for (unsigned in = 0; in < Tn; ++in) 
-    chess_unroll_loop(Tn)
+    //chess_unroll_loop(Tn)
     {
       const int8 * __restrict pA1 = pA + ( im * Tk + 0) * MMUL::size_A;
       const int8 * __restrict pB1 = pB + ( 0 * Tn + in) * MMUL::size_B;
