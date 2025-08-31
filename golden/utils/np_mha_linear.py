@@ -27,6 +27,7 @@ def _quantize_gemm(x_int8_2d, W_int8_2d):
     """
     acc = x_int8_2d.astype(np.int32) @ W_int8_2d.astype(np.int32)
     shift = _choose_shift(acc)
+    print(f"SHIFT = {shift}")
     y = (acc >> shift).astype(np.int32)
     y = np.clip(y, -128, 127).astype(np.int8)
     return y, shift
@@ -70,6 +71,7 @@ class NumpyMHALinear:
         v_btc, _ = to_btc(v if v is not None else q)
 
         B, T, C = q_btc.shape
+        print(f"T = {T}")
         assert C == self.C, f"Expected last dim {self.C}, got {C}"
 
         # Ensure int8 inputs
@@ -83,7 +85,7 @@ class NumpyMHALinear:
         k2d = k8.reshape(BT, C)
         v2d = v8.reshape(BT, C)
 
-        q_proj, sh_q = _quantize_gemm(q2d, self.Wq)  # (BT,C) int8
+        q_proj, sh_q = _quantize_gemm(q2d, self.Wq)  # (BT,C) int8; (150,64)@(64,64)
         k_proj, sh_k = _quantize_gemm(k2d, self.Wk)
         v_proj, sh_v = _quantize_gemm(v2d, self.Wv)
 
@@ -106,22 +108,23 @@ class NumpyMHALinear:
             for h in range(self.H):
                 Q = qh[b, h].astype(np.int32)              # (T,dh)
                 Kt = kh[b, h].astype(np.int32).T           # (dh,T)
-                scores_acc = Q @ Kt                         # (T,T) int32
+                scores_acc = Q @ Kt                         # (T,T) int32 //LAYER
 
                 # # NONLINEAR (commented): scaling and softmax
                 # # scale = 1.0 / math.sqrt(self.dh)     # float
                 # # scores = scores_acc * scale
                 # # attn = softmax(scores, axis=-1)      # non-linear
                 # # if training and dropout>0: apply dropout mask
-
                 # Quantize scores to int8
                 sh_s = _choose_shift(scores_acc)
+                print(f"SHIFT_S = {sh_s}")
                 scores_q = np.clip(scores_acc >> sh_s, -128, 127).astype(np.int8)  # (T,T)
 
                 V = vh[b, h].astype(np.int32)               # (T,dh), promote for accum
                 ctx_acc = scores_q.astype(np.int32) @ V     # (T,dh) int32
 
                 sh_c = _choose_shift(ctx_acc)
+                print(f"SHIFT_C = {sh_c}")
                 ctx_q = np.clip(ctx_acc >> sh_c, -128, 127).astype(np.int8)  # (T,dh)
 
                 ctx_h[b, h] = ctx_q

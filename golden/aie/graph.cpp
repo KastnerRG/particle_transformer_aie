@@ -1,4 +1,3 @@
-
 #include <adf.h>
 #include "include.h"
 #include <vector>
@@ -7,7 +6,8 @@ using namespace adf;
 
 class simpleGraph : public adf::graph {
 private:
-  kernel layers [N_LAYERS];
+  kernel layers [1];
+  kernel mha [6]; // 5*num_head + 1
 public:
   input_plio  AIE_IN;
   output_plio AIE_OUT;

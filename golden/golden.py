@@ -10,12 +10,12 @@ def tile_matrix(matrix, row_tiles, col_tiles): # (R,C) -> (R/r, C/c, r, c).flatt
     transposed = reshaped.transpose(0, 2, 1, 3) # (R/r, C/c, r, c)
     return transposed.flatten()
 
-def process_layer(idx, layer, m, k, n, iterations):
+def process_dense_layer(idx, layer, m, k, n, iterations):
 
     # Generate weights & intermediate input/output matrices
     k_tiled = tile_matrix(layer["k"], k, n)
     np.savetxt(f"data/k{idx}.txt", layer["k"], fmt="%d")
-    array_str = ', '.join(str(x) for x in k_tiled)
+    # array_str = ', '.join(str(x) for x in k_tiled)
     # with open("aie/weights.h", 'a') as f:
     #     f.write(f"#include <cstdint>\n__attribute__((section(\".data\"))) const int8_t k{idx} [{k_tiled.size}] = {{ {array_str} }};\n")
 
@@ -35,15 +35,13 @@ def process_layer(idx, layer, m, k, n, iterations):
     with open(f"aie/layer_{idx}.cc", "a") as f:
         f.write(f'''
 #include <cstdint>
-__attribute__((section(".data"))) alignas(32) int8_t k_p [{k_tiled.size}] = {{ {", ".join(str(int(g)) for g in k_tiled)} }};
+__attribute__((section(".data"))) alignas(32) int8_t k_p [{k_tiled.size}] = {{ {", ".join(str(int(x)) for x in k_tiled)} }};
 
 #include "kernels.h"
 
 void f{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu}> (x, a, k_p);}}
 ''')
-    
-    # with open(f"data/x{idx}.txt", "ab") as f:
-    #     np.savetxt(f, np.zeros((4, 16), dtype=int), fmt="%s", delimiter=" ")
+
 
     # model.cc - each layer as function
 
@@ -87,6 +85,143 @@ def golden_fc(x, k, is_relu, shift):
     layer_fc =  [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
     return a, layer_fc 
 
+def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iterations):
+     # Generate weights & intermediate input/output matrices
+    Wq_tiled = tile_matrix(layer_q["k"], k, n)
+    np.savetxt(f"data/mha_Wq{idx}.txt", layer_q["k"], fmt="%d")
+    Wk_tiled = tile_matrix(layer_k["k"], k, n)
+    np.savetxt(f"data/mha_Wk{idx}.txt", layer_k["k"], fmt="%d")
+    Wv_tiled = tile_matrix(layer_v["k"], k, n)
+    np.savetxt(f"data/mha_Wv{idx}.txt", layer_v["k"], fmt="%d")
+    Wo_tiled = tile_matrix(layer_o["k"], k, n)
+    np.savetxt(f"data/mha_Wo{idx}.txt", layer_o["k"], fmt="%d")
+
+    x_tiled = tile_matrix(layer_q["x"], m, k)
+    a_tiled = tile_matrix(layer_o["a"], m, n)
+    np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
+    np.savetxt(f"data/a{idx}.txt", np.tile(a_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
+
+    m = 2
+    k = 8
+    n = 8
+    num_heads = 4
+    d_model = 64
+    T = 150 # first dimension of input to mha
+    SHIFT_Q = 11
+    SHIFT_K = 10
+    SHIFT_V = 10
+    SHIFT_S = 8
+    SHIFT_C = 11
+    SHIFT_O = 9
+
+    head_dim = d_model // num_heads
+
+    # Q   TODO: repeat for each head
+    with open(f"aie/layer_{idx}_q.cc", "a") as f:
+        f.write(f'''
+#include <cstdint>
+__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wq_tiled.size}] = {{ {", ".join(str(int(x)) for x in Wq_tiled)} }};
+
+#include "kernels.h"
+
+void q{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_Q}, false>(x, a, k_p);}}
+''')
+    # K   TODO: repeat for each head
+    with open(f"aie/layer_{idx}_k.cc", "a") as f:
+        f.write(f'''
+#include <cstdint>
+__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wk_tiled.size}] = {{ {", ".join(str(int(x)) for x in Wk_tiled)} }};
+
+#include "kernels.h"
+
+void k{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_K}, false>(x, a, k_p);}}
+''')
+    # V   TODO: repeat for each head
+    with open(f"aie/layer_{idx}_v.cc", "a") as f:
+        f.write(f'''
+#include <cstdint>
+__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wv_tiled.size}] = {{ {", ".join(str(int(x)) for x in Wv_tiled)} }};
+
+#include "kernels.h"
+
+void v{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_V}, false>(x, a, k_p);}}
+''')
+    # score = (Q @ K^T)   TODO: repeat for each head
+    with open(f"aie/layer_{idx}_attn.cc", "a") as f:
+        f.write(f'''
+#include "kernels.h"
+
+void attn{idx}(input_window_int8 * __restrict q_head, input_window_int8 * __restrict k_head, output_window_int8 * __restrict o_head){{ attention<{m}, {k}, {n}, {head_dim}, {T}, {SHIFT_S}, {SHIFT_C}>(q_head, k_head, o_head);}}
+''')
+    # head = (scores @ V)   TODO: repeat for each head
+    with open(f"aie/layer_{idx}_head.cc", "a") as f:
+        f.write(f'''
+#include "kernels.h"
+
+void head{idx}(input_window_int8 * __restrict x, input_window_int8 * __restrict v, output_window_int8 * __restrict a){{ dense_in<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}, false>(x, a, v);}}
+''')
+    head_idx = 0
+    # (concatenated heads @ Wo)
+    with open(f"aie/layer_{idx}_out.cc", "a") as f:
+        f.write(f'''
+#include <cstdint>
+__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wo_tiled.size}] = {{ {", ".join(str(int(x)) for x in Wo_tiled)} }};
+
+#include "kernels.h"
+
+void out{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ output<{m}, {k}, {n}, {head_dim}, {d_model}, {head_idx}, {num_heads}, {T}, {SHIFT_O}>(x, a, k_p);}}
+''')
+    
+    in_bytes = layer_q['x'].size * layer_q['x'].itemsize
+    in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
+    q_bytes = layer_q['a'].size * layer_q['a'].itemsize
+    q_port = f"mha[{0}]"
+    k_bytes = layer_k['a'].size * layer_k['a'].itemsize
+    v_bytes = layer_v['a'].size * layer_v['a'].itemsize
+    attn_bytes = 9600 # TODO: FIX
+    head_bytes = layer_o['x'].size * layer_o['x'].itemsize
+
+    with open("aie/layer_graph.h", "a") as f: # TODO: set mha index properly
+        f.write(f"mha[{0}] = kernel::create(q{idx});\n")
+        f.write(f'source(mha[{0}]) = "layer_{idx}_q.cc";\n')
+        f.write(f'runtime<ratio>(mha[{0}]) = 1.0;\n')
+        f.write(f"connect<window<{in_bytes}>>({in_port}.out[0], mha[{0}].in[0]);\n\n")
+
+        f.write(f"mha[{1}] = kernel::create(k{idx});\n")
+        f.write(f'source(mha[{1}]) = "layer_{idx}_k.cc";\n')
+        f.write(f'runtime<ratio>(mha[{1}]) = 1.0;\n')
+        f.write(f"connect<window<{in_bytes}>>({in_port}.out[0], mha[{1}].in[0]);\n\n")
+
+        f.write(f"mha[{2}] = kernel::create(v{idx});\n")
+        f.write(f'source(mha[{2}]) = "layer_{idx}_v.cc";\n')
+        f.write(f'runtime<ratio>(mha[{2}]) = 1.0;\n')
+        f.write(f"connect<window<{in_bytes}>>({in_port}.out[0], mha[{2}].in[0]);\n\n")
+
+        f.write(f"mha[{3}] = kernel::create(attn{idx});\n")
+        f.write(f'source(mha[{3}]) = "layer_{idx}_attn.cc";\n')
+        f.write(f'runtime<ratio>(mha[{3}]) = 1.0;\n')
+        f.write(f"connect<window<{q_bytes}>>(mha[{0}].out[0], mha[{3}].in[0]);\n\n")
+        f.write(f"connect<window<{k_bytes}>>(mha[{1}].out[0], mha[{3}].in[1]);\n\n")
+
+        f.write(f"mha[{4}] = kernel::create(head{idx});\n")
+        f.write(f'source(mha[{4}]) = "layer_{idx}_head.cc";\n')
+        f.write(f'runtime<ratio>(mha[{4}]) = 1.0;\n')
+        f.write(f"connect<window<{attn_bytes}>>(mha[{3}].out[0], mha[{4}].in[0]);\n\n")
+        f.write(f"connect<window<{v_bytes}>>(mha[{2}].out[0], mha[{4}].in[1]);\n\n")
+
+        f.write(f"mha[{5}] = kernel::create(out{idx});\n")
+        f.write(f'source(mha[{5}]) = "layer_{idx}_out.cc";\n')
+        f.write(f'runtime<ratio>(mha[{5}]) = 1.0;\n')
+        f.write(f"connect<window<{head_bytes}>>(mha[{4}].out[0], mha[{5}].in[0]);\n\n")
+
+def to_btc(t):
+    if t.ndim == 2:  # (T,C)
+        return t[None, ...]
+    if t.ndim == 3:  # (B,T,C)
+        return t
+    raise ValueError("Expected (T,C) or (B,T,C)")
+
+
 if __name__ == "__main__":
     ################################################## PYTHON REFERENCE ##################################################
     layers = []
@@ -97,29 +232,41 @@ if __name__ == "__main__":
     num_feature_pad = 8   # pad to multiple of 8 for AIE tiling
 
     ###################################################################### below is layer 1
-    # ---- Input + padding (3 -> 32) ----
+    # ---- Input + padding (3 -> 8) ----
     dummy_inp = np.random.randint(-128, 128, size=(in_particles, num_feature), dtype=np.int8)
     pad_inp   = np.zeros((in_particles, num_feature_pad), dtype=np.int8)
     pad_inp[:, :num_feature] = dummy_inp
 
-    # ---- Dense to reach MHA width: (150,32) · (32,64) -> (150,64) ----
+    # ---- Dense to reach MHA width: (150,8) · (8,64) -> (150,64) ----
     W_fc1 = np.random.randint(-128, 128, size=(num_feature_pad, ff_dim), dtype=np.int8)
     a1, L1 = golden_fc(pad_inp, W_fc1, is_relu=True, shift=2)
     layers += L1
 
-    # # ---- MHA 1 + residual ----
-    # numheads = 4
-    # mha1 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha1", seed=0)
-    # att1 = mha1(a1, a1, a1, layers=layers)      # self-attention: Q=K=V=a1
+    # ---- MHA 1 + residual ----
+    numheads = 1 #4
+    seed = 0
+    rng = np.random.default_rng(seed)
+    Wq = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    Wk = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    Wv = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    Wo = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    Wq_btc = to_btc(Wq)
+    Wk_btc = to_btc(Wk)
+    Wv_btc = to_btc(Wv)
+    Wo_btc = to_btc(Wo)
+    mha1 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha1", seed=0, Wq=Wq, Wk=Wk, Wv=Wv, Wo=Wo)
+    att1 = mha1(a1, a1, a1, layers=layers)      # self-attention: Q=K=V=a1
     # a2   = residual_add_int8(att1, a1)          # Add()([x, emb])
 
     # ###################################################################### below is layer 2
     # # ---- Two dense (FF) + residual (Block 1) ----
     # W_ff1a = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    # h1, L2a = golden_fc(a2, W_ff1a, is_relu=True, shift=3); layers += L2a
+    # h1, L2a = golden_fc(a2, W_ff1a, is_relu=True, shift=3); 
+    # layers += L2a
 
     # W_ff1b = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    # h2, L2b = golden_fc(h1, W_ff1b, is_relu=True, shift=3); layers += L2b
+    # h2, L2b = golden_fc(h1, W_ff1b, is_relu=True, shift=3); 
+    # layers += L2b
 
     # lo1 = residual_add_int8(h2, a2)
 
@@ -127,6 +274,7 @@ if __name__ == "__main__":
     # mha2 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha2", seed=1)
     # att2 = mha2(lo1, lo1, lo1, layers=layers)
     # a3   = residual_add_int8(att2, lo1)
+
     # ####################################################################### below is layer 3
     # # ---- Two dense (FF) + residual (Block 2) ----
     # W_ff2a = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
@@ -159,7 +307,7 @@ if __name__ == "__main__":
 
     for path in [
         "data", "aie/layer_graph.h", "aie/include.h", "aie/model.cc", "aie/model.h",
-        "aie/weights.h", "aie/layer_0.cc", "aie/layer_1.cc", 
+        "aie/weights.h", "aie/layer_0.cc",  "aie/layer_1_attn.cc", "aie/layer_1_head.cc", "aie/layer_1_k.cc", "aie/layer_1_out.cc", "aie/layer_1_q.cc", "aie/layer_1_v.cc", 
         "*.log", "aiesimulator_output", "Work", ".Xil", 
         ".AIE_SIM_CMD_LINE_OPTIONS", "ISS_RPC_SERVER_PORT",
         "libadf.a", "Map_Report.csv", "pl_sample_counts",
@@ -174,12 +322,19 @@ if __name__ == "__main__":
     
     os.makedirs("data")
 
+    print_layers_brief(layers)
+
     # 1. include.h - common parameters
     
     with open("aie/include.h", "w") as f:
-        f.write(f'#define N_LAYERS {len(layers)}\n#define ITERATIONS {iterations}\n')
-        for idx in range(len(layers)):
-                f.write(f'void f{idx}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
+        f.write(f'#define N_LAYERS {1}\n#define ITERATIONS {iterations}\n')
+        f.write(f'void f{0}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
+        f.write(f'void q{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
+        f.write(f'void k{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
+        f.write(f'void v{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
+        f.write(f'void attn{1}(input_window_int8 * __restrict, input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
+        f.write(f'void head{1}(input_window_int8 * __restrict, input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
+        f.write(f'void out{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
 
     # 2. Preamble of model.cc - each layer as function
 
@@ -189,8 +344,8 @@ if __name__ == "__main__":
 
     # 3. Process each layer: write weights.h, x.txt, a.txt, model.cc, model.h, layer_graph.h
 
-    for i, layer in enumerate(layers):
-        process_layer(i, layer, m, k, n, iterations)
+    process_dense_layer(0, layers[0], m, k, n, iterations)
+    process_mha_layer(1, m, k, n, layers[1], layers[2], layers[3], layers[4], iterations)
     
     tiled_mat = tile_matrix(layers[-1]['a'], m, n)
     np.savetxt("data/out_ref.txt", np.tile(tiled_mat, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
@@ -199,7 +354,7 @@ if __name__ == "__main__":
     
     out_bytes = layers[-1]['a'].size * layers[-1]['a'].itemsize
     with open("aie/layer_graph.h", "a") as f:
-        f.write(f"connect<window<{out_bytes:>5}>>(layers[{len(layers)-1}].out[0], AIE_OUT.in[0]);\n")    
+        f.write(f"connect<window<{out_bytes:>5}>>(mha[{5}].out[0], AIE_OUT.in[0]);\n")    
 
     # 5. Run AIE (graph.cpp)
 
