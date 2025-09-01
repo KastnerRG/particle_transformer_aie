@@ -97,9 +97,9 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
     np.savetxt(f"data/mha_Wo{idx}.txt", layer_o["k"], fmt="%d")
 
     x_tiled = tile_matrix(layer_q["x"], m, k)
-    a_tiled = tile_matrix(layer_o["a"], m, n)
+    # a_tiled = tile_matrix(layer_o["a"], m, n)
     np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
-    np.savetxt(f"data/a{idx}.txt", np.tile(a_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
+    # np.savetxt(f"data/a{idx}.txt", np.tile(a_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
 
     m = 2
     k = 8
@@ -107,12 +107,12 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
     num_heads = 4
     d_model = 64
     T = 150 # first dimension of input to mha
-    SHIFT_Q = 11
-    SHIFT_K = 10
-    SHIFT_V = 10
+    SHIFT_Q = 10
+    SHIFT_K = 11
+    SHIFT_V = 11
     SHIFT_S = 8
-    SHIFT_C = 11
-    SHIFT_O = 9
+    SHIFT_C = 10
+    SHIFT_O = 10
 
     head_dim = d_model // num_heads
 
@@ -224,6 +224,9 @@ def to_btc(t):
 
 if __name__ == "__main__":
     ################################################## PYTHON REFERENCE ##################################################
+    seed = 0
+    rng = np.random.default_rng(seed)
+    
     layers = []
     # out_dim = 5
 
@@ -233,19 +236,17 @@ if __name__ == "__main__":
 
     ###################################################################### below is layer 1
     # ---- Input + padding (3 -> 8) ----
-    dummy_inp = np.random.randint(-128, 128, size=(in_particles, num_feature), dtype=np.int8)
+    dummy_inp = rng.integers(-128, 128, size=(in_particles, num_feature), dtype=np.int8)
     pad_inp   = np.zeros((in_particles, num_feature_pad), dtype=np.int8)
     pad_inp[:, :num_feature] = dummy_inp
 
     # ---- Dense to reach MHA width: (150,8) · (8,64) -> (150,64) ----
-    W_fc1 = np.random.randint(-128, 128, size=(num_feature_pad, ff_dim), dtype=np.int8)
+    W_fc1 = rng.integers(-128, 128, size=(num_feature_pad, ff_dim), dtype=np.int8)
     a1, L1 = golden_fc(pad_inp, W_fc1, is_relu=True, shift=2)
     layers += L1
 
     # ---- MHA 1 + residual ----
     numheads = 1 #4
-    seed = 0
-    rng = np.random.default_rng(seed)
     Wq = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
     Wk = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
     Wv = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
@@ -254,7 +255,7 @@ if __name__ == "__main__":
     Wk_btc = to_btc(Wk)
     Wv_btc = to_btc(Wv)
     Wo_btc = to_btc(Wo)
-    mha1 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha1", seed=0, Wq=Wq, Wk=Wk, Wv=Wv, Wo=Wo)
+    mha1 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha1", seed=seed, Wq=Wq, Wk=Wk, Wv=Wv, Wo=Wo)
     att1 = mha1(a1, a1, a1, layers=layers)      # self-attention: Q=K=V=a1
     # a2   = residual_add_int8(att1, a1)          # Add()([x, emb])
 

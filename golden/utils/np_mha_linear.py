@@ -52,6 +52,7 @@ class NumpyMHALinear:
 
         def initW():
             return rng.integers(-128, 128, size=(d_model, d_model), dtype=np.int8)
+            print("making a weight")
 
         self.Wq = Wq if Wq is not None else initW()
         self.Wk = Wk if Wk is not None else initW()
@@ -71,7 +72,6 @@ class NumpyMHALinear:
         v_btc, _ = to_btc(v if v is not None else q)
 
         B, T, C = q_btc.shape
-        print(f"T = {T}")
         assert C == self.C, f"Expected last dim {self.C}, got {C}"
 
         # Ensure int8 inputs
