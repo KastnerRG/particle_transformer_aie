@@ -18,14 +18,14 @@ void dense(
   int8* __restrict pC = (int8*) matC->ptr;
 
   //For profiling only 
-  unsigned long long cycle_num[2];
-  aie::tile tile=aie::tile::current();
-  cycle_num[0]=tile.cycles();
+  // unsigned long long cycle_num[2];
+  // aie::tile tile=aie::tile::current();
+  // cycle_num[0]=tile.cycles();
 
-  for (unsigned im = 0; im < Tm; ++im) 
+  for (unsigned im = 0; im < Tm; ++im) //Tm = 75
   //chess_unroll_loop(Tm)
   {
-    for (unsigned in = 0; in < Tn; ++in) 
+    for (unsigned in = 0; in < Tn; ++in) //Tn = 8 (split by heads)
     //chess_unroll_loop(Tn)
     {
       const int8 * __restrict pA1 = pA + ( im * Tk + 0) * MMUL::size_A;
@@ -50,109 +50,140 @@ void dense(
     }
   }
   //For profiling only 
-  cycle_num[1]=tile.cycles();
-  printf("start=%lld,end=%lld,total=%lld\n",cycle_num[0],cycle_num[1],cycle_num[1]-cycle_num[0]);
-}
-
-// dense layer with weights as input
-template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT, bool is_relu>
-void dense_in(
-  input_window_int8 * __restrict matA,
-  output_window_int8 * __restrict matC,
-  input_window_int8 * __restrict matB
-  ){
-  using MMUL = aie::mmul<m, k, n, int8, int8>;
-  const int8* __restrict pA = (int8*) matA->ptr;
-  const int8* __restrict pB = (int8*) matB->ptr;
-  int8* __restrict pC      = (int8*) matC->ptr;
-
-  //For profiling only 
-  unsigned long long cycle_num[2];
-  aie::tile tile=aie::tile::current();
-  cycle_num[0]=tile.cycles();
-
-  for (unsigned im = 0; im < Tm; ++im) 
-  //chess_unroll_loop(Tm)
-  {
-    for (unsigned in = 0; in < Tn; ++in) 
-    //chess_unroll_loop(Tn)
-    {
-      const int8 * __restrict pA1 = pA + ( im * Tk + 0) * MMUL::size_A;
-      const int8 * __restrict pB1 = pB + ( 0 * Tn + in) * MMUL::size_B;
-
-      aie::vector<int8, MMUL::size_A> A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-      aie::vector<int8, MMUL::size_B> B = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * Tn;
-
-      MMUL C; 
-      C.mul(A, B);
-
-      for (unsigned ik = 0; ik < Tk-1; ++ik) 
-      chess_flatten_loop
-      {
-        A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-        B = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * Tn;
-        C.mac(A, B);
-      }
-      auto C_vec = C.template to_vector<int8>(SHIFT);
-      auto C_out = is_relu ? aie::max(C_vec, (int8)0) : C_vec;
-      aie::store_v(pC, C_out); pC += MMUL::size_C;
-    }
-  }
-  //For profiling only 
-  cycle_num[1]=tile.cycles();
-  printf("start=%lld,end=%lld,total=%lld\n",cycle_num[0],cycle_num[1],cycle_num[1]-cycle_num[0]);
+  // cycle_num[1]=tile.cycles();
+  // printf("start=%lld,end=%lld,total=%lld\n",cycle_num[0],cycle_num[1],cycle_num[1]-cycle_num[0]);
 }
 
 // Attention kernel - calculates attention scores
-template <int m, int k, int n, int head_dim, int T, int SHIFT_S, int SHIFT_C>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int SHIFT_S>
 void attention(
   input_window_int8* __restrict q_head,
   input_window_int8* __restrict k_head,
-  output_window_int8* __restrict scores_window
+  output_stream_int8* __restrict scores_window
 ) {
-  // Get pointers
-  const int8* __restrict pQ = (int8*)q_head->ptr;
-  const int8* __restrict pK = (int8*)k_head->ptr;
-  int8* __restrict pScores = (int8*)scores_window->ptr;
-  
-  // Temporary buffer for attention scores (T×T)
-  // int8 scores[150*150];  // Using max size, adjust as needed (input first dimension)
-  
-  // Calculate attention scores (Q @ K^T) - manual implementation needed for transpose
-  for (int q_pos = 0; q_pos < T; q_pos++) {
-    for (int k_pos = 0; k_pos < T; k_pos++) {
-      // Calculate dot product
-      int32_t score = 0;
-      for (int d = 0; d < head_dim; d++) {
-        score += (int32_t)pQ[q_pos*head_dim + d] * (int32_t)pK[k_pos*head_dim + d];
-      }
-      // Apply shift for quantization to output
-      *pScores++ = (int8)(score >> SHIFT_S);
+  using MMUL = aie::mmul<m, k, n, int8, int8>;
+  const int8* __restrict pQ = (int8*)q_head->ptr; // (160, 64)
+  const int8* __restrict pK = (int8*)k_head->ptr; // (160, 64)
+  //int8* __restrict pScores = (int8*)scores_window->ptr; // (160, 160)
+  // Temporary buffer for transpose of K
+  alignas(aie::vector_decl_align) int8 k_transposed_data[d_model * T];
+
+  //transpose K (maybe can improve speed with tiling)
+  for (int r = 0; r < T; ++r){
+    for (int c = 0; c < d_model; ++c) {
+      k_transposed_data[c * T + r] = pK[r * d_model + c];
     }
   }
+  const int8* __restrict pK_t = k_transposed_data;
+
+  // tiled matrix multiplication like dense kernel (Q @ K^T)
+  for (unsigned im = 0; im < Tm; ++im) 
+  //chess_unroll_loop(Tm)
+  {
+    for (unsigned in = 0; in < Tn; ++in) 
+    //chess_unroll_loop(Tn)
+    {
+      const int8 * __restrict pA1 = pQ + ( im * Tk + 0) * MMUL::size_A;
+      const int8 * __restrict pB1 = pK_t + ( 0 * Tn + in) * MMUL::size_B;
+
+      aie::vector<int8, MMUL::size_A> A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+      aie::vector<int8, MMUL::size_B> B = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * Tn;
+
+      MMUL C; 
+      C.mul(A, B);
+
+      for (unsigned ik = 0; ik < Tk-1; ++ik) 
+      chess_flatten_loop
+      {
+        A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+        B = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * Tn;
+        C.mac(A, B);
+      }
+      // auto C_vec = C.template to_vector<int8>(SHIFT_S);
+      // aie::store_v(pScores, C_vec); 
+      // pScores += MMUL::size_C;
+      using VC = aie::vector<int8, MMUL::size_C>;
+      VC v = C.template to_vector<int8>(SHIFT_S);
+      writeincr(scores_window, v);
+    }
+  }
+}
+
+// dense layer with weights as input
+template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT>
+void head(
+  input_stream_int8 * __restrict matA,
+  output_stream_int8 * __restrict matC,
+  input_window_int8 * __restrict matB
+  ){
+  using MMUL = aie::mmul<m, k, n, int8, int8>;
+  // const int8* __restrict pA = (int8*) matA->ptr;
+  const int8* __restrict pB = (int8*) matB->ptr;
+  //int8* __restrict pC      = (int8*) matC->ptr;
+
+  //For profiling only 
+  // unsigned long long cycle_num[2];
+  // aie::tile tile=aie::tile::current();
+  // cycle_num[0]=tile.cycles();
+
+  for (unsigned im = 0; im < Tm; ++im) 
+  //chess_unroll_loop(Tm)
+  {
+    for (unsigned in = 0; in < Tn; ++in) 
+    //chess_unroll_loop(Tn)
+    {
+      //const int8 * __restrict pA1 = pA + ( im * Tk + 0) * MMUL::size_A;
+      const int8 * __restrict pB1 = pB + ( 0 * Tn + in) * MMUL::size_B;
+
+      aie::vector<int8, MMUL::size_A> A = readincr_v<MMUL::size_A>(matA);
+      //aie::vector<int8, MMUL::size_A> A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+      aie::vector<int8, MMUL::size_B> B = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * Tn;
+
+      MMUL C; 
+      C.mul(A, B);
+
+      for (unsigned ik = 0; ik < Tk-1; ++ik) 
+      chess_flatten_loop
+      {
+        A = readincr_v<MMUL::size_A>(matA);
+        //A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+        B = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * Tn;
+        C.mac(A, B);
+      }
+      // auto C_vec = C.template to_vector<int8>(SHIFT);
+      // aie::store_v(pC, C_vec); pC += MMUL::size_C;
+      using VC = aie::vector<int8, MMUL::size_C>;
+      VC v = C.template to_vector<int8>(SHIFT);
+      writeincr(matC, v);
+    }
+  }
+  //For profiling only 
+  // cycle_num[1]=tile.cycles();
+  // printf("start=%lld,end=%lld,total=%lld\n",cycle_num[0],cycle_num[1],cycle_num[1]-cycle_num[0]);
 }
 
 // Output projection kernel - interleaves context vectors and applies output projection
 template <int m, int k, int n, int head_dim, int d_model, int head_idx, int num_heads, int T, int SHIFT_O>
 void output(
-  input_window_int8* __restrict context_vector,
+  input_stream_int8* __restrict context_vector,
   output_window_int8* __restrict output,
   const int8 Wo[]
 ) {
   // Get pointers
-  const int8* __restrict pContext = (int8*)context_vector->ptr;
+  //const int8* __restrict pContext = (int8*)context_vector->ptr;
   int8* __restrict pOutput = (int8*)output->ptr;
   
   // Static buffer for combined heads
-  static int8 combined_heads[150*64];  // Using max size, adjust as needed
+  // static int8 combined_heads[160*64];  // Using max size, adjust as needed
   
-  // Interleave this head's context vector into the combined heads buffer
-  for (int t = 0; t < T; t++) {
-    for (int d = 0; d < head_dim; d++) {
-      // Place this head's output in the right position in the combined buffer
-      combined_heads[t*d_model + head_idx*head_dim + d] = pContext[t*head_dim + d];
-    }
-  }
+  // // Interleave this head's context vector into the combined heads buffer
+  // for (int t = 0; t < T; t++) {
+  //   for (int d = 0; d < head_dim; d++) {
+  //     // Place this head's output in the right position in the combined buffer
+  //     combined_heads[t*d_model + head_idx*head_dim + d] = pContext[t*head_dim + d];
+  //   }
+  // }
+  //printf("head_idx = %d\nnum_heads = %d\n", head_idx, num_heads);
   
   // If this is the last head, perform output projection
   if (head_idx == num_heads - 1) {
@@ -163,24 +194,27 @@ void output(
     // temp_out.ptr = pOutput;
     // dense<m, k, n, T/m, d_model/k, d_model/n, SHIFT_O, false>(&temp_in, &temp_out, Wo);
 
-    // Inline dense layer (combined_heads @ Wo)
+    // tiled matrix multiplication like dense layer (combined_heads @ Wo)
     const int Tm = T / m;
     const int Tk = d_model / k;
     const int Tn = d_model / n;
 
     using MMUL = aie::mmul<m, k, n, int8, int8>;
-    const int8* __restrict pA = combined_heads; // Matrix A is the combined heads buffer
+
+    //const int8* __restrict pA = pContext; // Matrix A is the combined heads buffer
     const int8* __restrict pB = Wo;             // Matrix B is the output weight matrix
     int8* __restrict pC = pOutput;              // Matrix C is the final output
 
+    //printf("Tm = %d\nTn = %d\n", Tm, Tn);
     for (unsigned im = 0; im < Tm; ++im) 
     {
       for (unsigned in = 0; in < Tn; ++in) 
       {
-        const int8 * __restrict pA1 = pA + (im * Tk + 0) * MMUL::size_A;
+        aie::vector<int8, MMUL::size_A> A = readincr_v<MMUL::size_A>(context_vector);
+        //const int8 * __restrict pA1 = pA + (im * Tk + 0) * MMUL::size_A;
         const int8 * __restrict pB1 = pB + ( 0 * Tn + in) * MMUL::size_B;
-
-        aie::vector<int8, MMUL::size_A> A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+        
+        //aie::vector<int8, MMUL::size_A> A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
         aie::vector<int8, MMUL::size_B> B = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * Tn;
 
         MMUL C; 
@@ -189,7 +223,8 @@ void output(
         for (unsigned ik = 0; ik < Tk-1; ++ik) 
         chess_flatten_loop
         {
-          A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+          A = readincr_v<MMUL::size_A>(context_vector);
+          //A = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
           B = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * Tn;
           C.mac(A, B);
         }
@@ -200,6 +235,10 @@ void output(
         pC += MMUL::size_C;
       }
     }
+    // for (int i = 0; i < 8; ++i) { // limit to 8 elements
+    //   printf("pA[%d] = %d\npB[%d] = %d\n", i, pA[i], i, pB[i]);
+    // }
+
   }
 }
 

@@ -27,7 +27,6 @@ def _quantize_gemm(x_int8_2d, W_int8_2d):
     """
     acc = x_int8_2d.astype(np.int32) @ W_int8_2d.astype(np.int32)
     shift = _choose_shift(acc)
-    print(f"SHIFT = {shift}")
     y = (acc >> shift).astype(np.int32)
     y = np.clip(y, -128, 127).astype(np.int8)
     return y, shift
@@ -117,14 +116,12 @@ class NumpyMHALinear:
                 # # if training and dropout>0: apply dropout mask
                 # Quantize scores to int8
                 sh_s = _choose_shift(scores_acc)
-                print(f"SHIFT_S = {sh_s}")
                 scores_q = np.clip(scores_acc >> sh_s, -128, 127).astype(np.int8)  # (T,T)
 
                 V = vh[b, h].astype(np.int32)               # (T,dh), promote for accum
                 ctx_acc = scores_q.astype(np.int32) @ V     # (T,dh) int32
 
                 sh_c = _choose_shift(ctx_acc)
-                print(f"SHIFT_C = {sh_c}")
                 ctx_q = np.clip(ctx_acc >> sh_c, -128, 127).astype(np.int8)  # (T,dh)
 
                 ctx_h[b, h] = ctx_q
@@ -140,6 +137,13 @@ class NumpyMHALinear:
         if layers is not None:
             layers.append({'name': f'{self.name}_Wo', 'x': ctx2d, 'k': self.Wo,
                            'y': out_proj, 'a': out_proj, 'shift': sh_o, 'is_relu': False})
+            
+        print(f"SHIFT_Q = {sh_q}")
+        print(f"SHIFT_K = {sh_k}")
+        print(f"SHIFT_V = {sh_v}")
+        print(f"SHIFT_S = {sh_s}")
+        print(f"SHIFT_C = {sh_c}")
+        print(f"SHIFT_O = {sh_o}")
 
         out = out_proj.reshape(B, T, C)  # int8
         return out[0] if squeezed else out

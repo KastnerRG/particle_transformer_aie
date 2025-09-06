@@ -9,7 +9,7 @@ v++ -c \
   --mode aie \
   --include $XILINX_VITIS/aietools/include \
   --include "./aie" \
-  --aie.xlopt=2 \
+  --aie.xlopt=1 \
   --platform $XILINX_VITIS/base_platforms/xilinx_vck190_base_202410_1/xilinx_vck190_base_202410_1.xpfm \
   --work_dir ./Work \
   --target hw \

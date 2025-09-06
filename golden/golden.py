@@ -10,6 +10,13 @@ def tile_matrix(matrix, row_tiles, col_tiles): # (R,C) -> (R/r, C/c, r, c).flatt
     transposed = reshaped.transpose(0, 2, 1, 3) # (R/r, C/c, r, c)
     return transposed.flatten()
 
+def pad_rows(matrix, target_rows=160):
+    rows, cols = matrix.shape
+    if rows < target_rows:
+        pad = np.zeros((target_rows - rows, cols), dtype=matrix.dtype)
+        return np.vstack([matrix, pad])
+    return matrix
+
 def process_dense_layer(idx, layer, m, k, n, iterations):
 
     # Generate weights & intermediate input/output matrices
@@ -87,15 +94,20 @@ def golden_fc(x, k, is_relu, shift):
 
 def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iterations):
      # Generate weights & intermediate input/output matrices
-    Wq_tiled = tile_matrix(layer_q["k"], k, n)
-    np.savetxt(f"data/mha_Wq{idx}.txt", layer_q["k"], fmt="%d")
-    Wk_tiled = tile_matrix(layer_k["k"], k, n)
-    np.savetxt(f"data/mha_Wk{idx}.txt", layer_k["k"], fmt="%d")
-    Wv_tiled = tile_matrix(layer_v["k"], k, n)
-    np.savetxt(f"data/mha_Wv{idx}.txt", layer_v["k"], fmt="%d")
-    Wo_tiled = tile_matrix(layer_o["k"], k, n)
-    np.savetxt(f"data/mha_Wo{idx}.txt", layer_o["k"], fmt="%d")
+    Wq_tiled   = tile_matrix(pad_rows(layer_q["k"]), k, n)
+    Wk_tiled   = tile_matrix(pad_rows(layer_k["k"]), k, n)
+    Wv_tiled   = tile_matrix(pad_rows(layer_v["k"]), k, n)
+    Wo_tiled   = tile_matrix(pad_rows(layer_o["k"]), k, n)
+    out_x_tiled = tile_matrix(pad_rows(layer_o["x"]), m, k)
 
+    np.savetxt(f"data/mha_Wq{idx}.txt", layer_q["k"], fmt="%d")
+    np.savetxt(f"data/mha_Wk{idx}.txt", layer_k["k"], fmt="%d")
+    np.savetxt(f"data/mha_Wv{idx}.txt", layer_v["k"], fmt="%d")
+    np.savetxt(f"data/mha_Wo{idx}.txt", layer_o["k"], fmt="%d")
+    np.savetxt(f"data/out_x{idx}.txt", np.tile(out_x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
+
+    # pad input
+    layer_q["x"] = pad_rows(layer_q["x"], target_rows=160)
     x_tiled = tile_matrix(layer_q["x"], m, k)
     # a_tiled = tile_matrix(layer_o["a"], m, n)
     np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
@@ -104,19 +116,19 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
     m = 2
     k = 8
     n = 8
-    num_heads = 4
+    num_heads = 1
     d_model = 64
-    T = 150 # first dimension of input to mha
+    T = 160 # first dimension of input to mha
     SHIFT_Q = 10
     SHIFT_K = 11
     SHIFT_V = 11
     SHIFT_S = 8
     SHIFT_C = 10
-    SHIFT_O = 10
+    SHIFT_O = 10 # layer_o["shift"]
 
     head_dim = d_model // num_heads
 
-    # Q   TODO: repeat for each head
+    # Q (160,64)@(64,64) TODO: repeat for each head
     with open(f"aie/layer_{idx}_q.cc", "a") as f:
         f.write(f'''
 #include <cstdint>
@@ -126,7 +138,7 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wq_tiled.size}] = {{ 
 
 void q{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_Q}, false>(x, a, k_p);}}
 ''')
-    # K   TODO: repeat for each head
+    # K (160,64)@(64,64) TODO: repeat for each head
     with open(f"aie/layer_{idx}_k.cc", "a") as f:
         f.write(f'''
 #include <cstdint>
@@ -136,7 +148,7 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wk_tiled.size}] = {{ 
 
 void k{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_K}, false>(x, a, k_p);}}
 ''')
-    # V   TODO: repeat for each head
+    # V (160,64)@(64,64) TODO: repeat for each head
     with open(f"aie/layer_{idx}_v.cc", "a") as f:
         f.write(f'''
 #include <cstdint>
@@ -146,22 +158,22 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wv_tiled.size}] = {{ 
 
 void v{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_V}, false>(x, a, k_p);}}
 ''')
-    # score = (Q @ K^T)   TODO: repeat for each head
+    # score = (Q @ K^T)  (160,64)@(64,160)  TODO: repeat for each head
     with open(f"aie/layer_{idx}_attn.cc", "a") as f:
         f.write(f'''
 #include "kernels.h"
 
-void attn{idx}(input_window_int8 * __restrict q_head, input_window_int8 * __restrict k_head, output_window_int8 * __restrict o_head){{ attention<{m}, {k}, {n}, {head_dim}, {T}, {SHIFT_S}, {SHIFT_C}>(q_head, k_head, o_head);}}
+void attn{idx}(output_stream_int8 * __restrict o_head, input_window_int8 * __restrict q_head, input_window_int8 * __restrict k_head){{ attention<{m}, {k}, {n}, {T//m}, {d_model//k}, {T//n}, {d_model}, {T}, {SHIFT_S}>(q_head, k_head, o_head);}}
 ''')
-    # head = (scores @ V)   TODO: repeat for each head
+    # head = (scores @ V) (160,160)@(160,64) TODO: repeat for each head
     with open(f"aie/layer_{idx}_head.cc", "a") as f:
         f.write(f'''
 #include "kernels.h"
 
-void head{idx}(input_window_int8 * __restrict x, input_window_int8 * __restrict v, output_window_int8 * __restrict a){{ dense_in<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}, false>(x, a, v);}}
+void head{idx}(input_stream_int8 * __restrict x, input_window_int8 * __restrict v, output_stream_int8 * __restrict a){{ head<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}>(x, a, v);}}
 ''')
     head_idx = 0
-    # (concatenated heads @ Wo)
+    # (concatenated heads @ Wo) (160,64)@(64,64)
     with open(f"aie/layer_{idx}_out.cc", "a") as f:
         f.write(f'''
 #include <cstdint>
@@ -169,16 +181,15 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wo_tiled.size}] = {{ 
 
 #include "kernels.h"
 
-void out{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ output<{m}, {k}, {n}, {head_dim}, {d_model}, {head_idx}, {num_heads}, {T}, {SHIFT_O}>(x, a, k_p);}}
+void out{idx}(input_stream_int8 * __restrict x, output_window_int8 * __restrict a){{ output<{m}, {k}, {n}, {head_dim}, {d_model}, {head_idx}, {num_heads}, {T}, {SHIFT_O}>(x, a, k_p);}}
 ''')
     
     in_bytes = layer_q['x'].size * layer_q['x'].itemsize
     in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
     q_bytes = layer_q['a'].size * layer_q['a'].itemsize
-    q_port = f"mha[{0}]"
     k_bytes = layer_k['a'].size * layer_k['a'].itemsize
     v_bytes = layer_v['a'].size * layer_v['a'].itemsize
-    attn_bytes = 9600 # TODO: FIX
+    # attn_bytes = T*T # large window size causes memory error
     head_bytes = layer_o['x'].size * layer_o['x'].itemsize
 
     with open("aie/layer_graph.h", "a") as f: # TODO: set mha index properly
@@ -206,13 +217,13 @@ void out{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict 
         f.write(f"mha[{4}] = kernel::create(head{idx});\n")
         f.write(f'source(mha[{4}]) = "layer_{idx}_head.cc";\n')
         f.write(f'runtime<ratio>(mha[{4}]) = 1.0;\n')
-        f.write(f"connect<window<{attn_bytes}>>(mha[{3}].out[0], mha[{4}].in[0]);\n\n")
+        f.write(f"connect<stream>(mha[{3}].out[0], mha[{4}].in[0]);\n\n")
         f.write(f"connect<window<{v_bytes}>>(mha[{2}].out[0], mha[{4}].in[1]);\n\n")
 
         f.write(f"mha[{5}] = kernel::create(out{idx});\n")
         f.write(f'source(mha[{5}]) = "layer_{idx}_out.cc";\n')
         f.write(f'runtime<ratio>(mha[{5}]) = 1.0;\n')
-        f.write(f"connect<window<{head_bytes}>>(mha[{4}].out[0], mha[{5}].in[0]);\n\n")
+        f.write(f"connect<stream>(mha[{4}].out[0], mha[{5}].in[0]);\n\n")
 
 def to_btc(t):
     if t.ndim == 2:  # (T,C)
@@ -333,9 +344,9 @@ if __name__ == "__main__":
         f.write(f'void q{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
         f.write(f'void k{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
         f.write(f'void v{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
-        f.write(f'void attn{1}(input_window_int8 * __restrict, input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
-        f.write(f'void head{1}(input_window_int8 * __restrict, input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
-        f.write(f'void out{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
+        f.write(f'void attn{1}(output_stream_int8 * __restrict, input_window_int8 * __restrict, input_window_int8 * __restrict);\n')
+        f.write(f'void head{1}(input_stream_int8 * __restrict, input_window_int8 * __restrict, output_stream_int8 * __restrict);\n')
+        f.write(f'void out{1}(input_stream_int8 * __restrict, output_window_int8 * __restrict);\n')
 
     # 2. Preamble of model.cc - each layer as function
 
