@@ -4,4 +4,4 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [10240] = { 14, 108, -5
 
 #include "kernels.h"
 
-void v1(input_window_int8 * __restrict x, output_window_int8 * __restrict a){ dense<2, 8, 8, 80, 8, 8, 11, false>(x, a, k_p);}
+void v1(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){ dense<2, 8, 8, 80, 8, 8, 11, false>(x, a, k_p);}

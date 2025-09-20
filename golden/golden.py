@@ -46,7 +46,7 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{k_tiled.size}] = {{ {
 
 #include "kernels.h"
 
-void f{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu}> (x, a, k_p);}}
+void f{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu}> (x, a, k_p);}}
 ''')
 
 
@@ -72,7 +72,7 @@ void f{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a)
         f.write(f"layers[{idx}] = kernel::create(f{idx});\n")
         f.write(f'source(layers[{idx}]) = "layer_{idx}.cc";\n')
         f.write(f'runtime<ratio>(layers[{idx}]) = 1.0;\n')
-        f.write(f"connect<window<{num_bytes}>>({in_port}.out[0], layers[{idx}].in[0]);\n\n")
+        f.write(f"connect<stream>({in_port}.out[0], layers[{idx}].in[0]);\n\n")
         if idx == 0 and num_bytes > 32768:
             f.write(f"single_buffer(layers[{idx}].in[0]);\n")
 
@@ -136,7 +136,7 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wq_tiled.size}] = {{ 
 
 #include "kernels.h"
 
-void q{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_Q}, false>(x, a, k_p);}}
+void q{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_Q}, false>(x, a, k_p);}}
 ''')
     # K (160,64)@(64,64) TODO: repeat for each head
     with open(f"aie/layer_{idx}_k.cc", "a") as f:
@@ -146,7 +146,7 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wk_tiled.size}] = {{ 
 
 #include "kernels.h"
 
-void k{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_K}, false>(x, a, k_p);}}
+void k{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_K}, false>(x, a, k_p);}}
 ''')
     # V (160,64)@(64,64) TODO: repeat for each head
     with open(f"aie/layer_{idx}_v.cc", "a") as f:
@@ -156,21 +156,21 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wv_tiled.size}] = {{ 
 
 #include "kernels.h"
 
-void v{idx}(input_window_int8 * __restrict x, output_window_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_V}, false>(x, a, k_p);}}
+void v{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_V}, false>(x, a, k_p);}}
 ''')
     # score = (Q @ K^T)  (160,64)@(64,160)  TODO: repeat for each head
     with open(f"aie/layer_{idx}_attn.cc", "a") as f:
         f.write(f'''
 #include "kernels.h"
 
-void attn{idx}(output_stream_int8 * __restrict o_head, input_window_int8 * __restrict q_head, input_window_int8 * __restrict k_head){{ attention<{m}, {k}, {n}, {T//m}, {d_model//k}, {T//n}, {d_model}, {T}, {SHIFT_S}>(q_head, k_head, o_head);}}
+void attn{idx}(output_stream_int8 * __restrict o_head, input_stream_int8 * __restrict q_head, input_stream_int8 * __restrict k_head){{ attention<{m}, {k}, {n}, {T//m}, {d_model//k}, {T//n}, {d_model}, {T}, {SHIFT_S}>(q_head, k_head, o_head);}}
 ''')
     # head = (scores @ V) (160,160)@(160,64) TODO: repeat for each head
     with open(f"aie/layer_{idx}_head.cc", "a") as f:
         f.write(f'''
 #include "kernels.h"
 
-void head{idx}(input_stream_int8 * __restrict x, input_window_int8 * __restrict v, output_stream_int8 * __restrict a){{ head<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}>(x, a, v);}}
+void head{idx}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ head<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}>(x, a, v);}}
 ''')
     head_idx = 0
     # (concatenated heads @ Wo) (160,64)@(64,64)
@@ -181,44 +181,44 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wo_tiled.size}] = {{ 
 
 #include "kernels.h"
 
-void out{idx}(input_stream_int8 * __restrict x, output_window_int8 * __restrict a){{ output<{m}, {k}, {n}, {head_dim}, {d_model}, {head_idx}, {num_heads}, {T}, {SHIFT_O}>(x, a, k_p);}}
+void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ output<{m}, {k}, {n}, {d_model}, {T}, {SHIFT_O}>(x, a, k_p);}}
 ''')
     
-    in_bytes = layer_q['x'].size * layer_q['x'].itemsize
+    # in_bytes = layer_q['x'].size * layer_q['x'].itemsize
     in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
-    q_bytes = layer_q['a'].size * layer_q['a'].itemsize
-    k_bytes = layer_k['a'].size * layer_k['a'].itemsize
-    v_bytes = layer_v['a'].size * layer_v['a'].itemsize
+    # q_bytes = layer_q['a'].size * layer_q['a'].itemsize
+    # k_bytes = layer_k['a'].size * layer_k['a'].itemsize
+    # v_bytes = layer_v['a'].size * layer_v['a'].itemsize
     # attn_bytes = T*T # large window size causes memory error
-    head_bytes = layer_o['x'].size * layer_o['x'].itemsize
+    # head_bytes = layer_o['x'].size * layer_o['x'].itemsize
 
     with open("aie/layer_graph.h", "a") as f: # TODO: set mha index properly
         f.write(f"mha[{0}] = kernel::create(q{idx});\n")
         f.write(f'source(mha[{0}]) = "layer_{idx}_q.cc";\n')
         f.write(f'runtime<ratio>(mha[{0}]) = 1.0;\n')
-        f.write(f"connect<window<{in_bytes}>>({in_port}.out[0], mha[{0}].in[0]);\n\n")
+        f.write(f"connect<stream>({in_port}.out[0], mha[{0}].in[0]);\n\n")
 
         f.write(f"mha[{1}] = kernel::create(k{idx});\n")
         f.write(f'source(mha[{1}]) = "layer_{idx}_k.cc";\n')
         f.write(f'runtime<ratio>(mha[{1}]) = 1.0;\n')
-        f.write(f"connect<window<{in_bytes}>>({in_port}.out[0], mha[{1}].in[0]);\n\n")
+        f.write(f"connect<stream>({in_port}.out[0], mha[{1}].in[0]);\n\n")
 
         f.write(f"mha[{2}] = kernel::create(v{idx});\n")
         f.write(f'source(mha[{2}]) = "layer_{idx}_v.cc";\n')
         f.write(f'runtime<ratio>(mha[{2}]) = 1.0;\n')
-        f.write(f"connect<window<{in_bytes}>>({in_port}.out[0], mha[{2}].in[0]);\n\n")
+        f.write(f"connect<stream>({in_port}.out[0], mha[{2}].in[0]);\n\n")
 
         f.write(f"mha[{3}] = kernel::create(attn{idx});\n")
         f.write(f'source(mha[{3}]) = "layer_{idx}_attn.cc";\n')
         f.write(f'runtime<ratio>(mha[{3}]) = 1.0;\n')
-        f.write(f"connect<window<{q_bytes}>>(mha[{0}].out[0], mha[{3}].in[0]);\n\n")
-        f.write(f"connect<window<{k_bytes}>>(mha[{1}].out[0], mha[{3}].in[1]);\n\n")
+        f.write(f"connect<stream>(mha[{0}].out[0], mha[{3}].in[0]);\n\n")
+        f.write(f"connect<stream>(mha[{1}].out[0], mha[{3}].in[1]);\n\n")
 
         f.write(f"mha[{4}] = kernel::create(head{idx});\n")
         f.write(f'source(mha[{4}]) = "layer_{idx}_head.cc";\n')
         f.write(f'runtime<ratio>(mha[{4}]) = 1.0;\n')
         f.write(f"connect<stream>(mha[{3}].out[0], mha[{4}].in[0]);\n\n")
-        f.write(f"connect<window<{v_bytes}>>(mha[{2}].out[0], mha[{4}].in[1]);\n\n")
+        f.write(f"connect<stream>(mha[{2}].out[0], mha[{4}].in[1]);\n\n")
 
         f.write(f"mha[{5}] = kernel::create(out{idx});\n")
         f.write(f'source(mha[{5}]) = "layer_{idx}_out.cc";\n')
@@ -340,13 +340,13 @@ if __name__ == "__main__":
     
     with open("aie/include.h", "w") as f:
         f.write(f'#define N_LAYERS {1}\n#define ITERATIONS {iterations}\n')
-        f.write(f'void f{0}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
-        f.write(f'void q{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
-        f.write(f'void k{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
-        f.write(f'void v{1}(input_window_int8 * __restrict, output_window_int8 * __restrict);\n')
-        f.write(f'void attn{1}(output_stream_int8 * __restrict, input_window_int8 * __restrict, input_window_int8 * __restrict);\n')
-        f.write(f'void head{1}(input_stream_int8 * __restrict, input_window_int8 * __restrict, output_stream_int8 * __restrict);\n')
-        f.write(f'void out{1}(input_stream_int8 * __restrict, output_window_int8 * __restrict);\n')
+        f.write(f'void f{0}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+        f.write(f'void q{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+        f.write(f'void k{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+        f.write(f'void v{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+        f.write(f'void attn{1}(output_stream_int8 * __restrict, input_stream_int8 * __restrict, input_stream_int8 * __restrict);\n')
+        f.write(f'void head{1}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+        f.write(f'void out{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
 
     # 2. Preamble of model.cc - each layer as function
 
@@ -366,7 +366,7 @@ if __name__ == "__main__":
     
     out_bytes = layers[-1]['a'].size * layers[-1]['a'].itemsize
     with open("aie/layer_graph.h", "a") as f:
-        f.write(f"connect<window<{out_bytes:>5}>>(mha[{5}].out[0], AIE_OUT.in[0]);\n")    
+        f.write(f"connect<stream>(mha[{5}].out[0], AIE_OUT.in[0]);\n")    
 
     # 5. Run AIE (graph.cpp)
 
