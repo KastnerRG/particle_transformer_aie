@@ -48,7 +48,7 @@ class NumpyMHALinear:
         self.dh = d_model // num_heads
         self.name = str(name_prefix)
         rng = np.random.default_rng(seed)
-
+        
         def initW():
             return rng.integers(-128, 128, size=(d_model, d_model), dtype=np.int8)
             print("making a weight")
@@ -84,7 +84,7 @@ class NumpyMHALinear:
         k2d = k8.reshape(BT, C)
         v2d = v8.reshape(BT, C)
 
-        q_proj, sh_q = _quantize_gemm(q2d, self.Wq)  # (BT,C) int8; (150,64)@(64,64)
+        q_proj, sh_q = _quantize_gemm(q2d, self.Wq)  # (BT,C) int8; (160,64)@(64,64)
         k_proj, sh_k = _quantize_gemm(k2d, self.Wk)
         v_proj, sh_v = _quantize_gemm(v2d, self.Wv)
 

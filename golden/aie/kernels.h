@@ -93,14 +93,14 @@ void dense(
   const int8* __restrict Bbase = (const int8*)matB;
   const unsigned strideB_perK  = MMUL::size_B * Tn;
 
-  for (unsigned im = 0; im < Tm; ++im)
-  chess_prepare_for_pipelining chess_loop_range(1,) {
+  for (unsigned im = 0; im < Tm; ++im) {
+   // chess_prepare_for_pipelining chess_loop_range(1,) {
     VA Abuf[Tk];
     for (unsigned ik = 0; ik < Tk; ++ik)
       Abuf[ik] = readincr_v<MMUL::size_A>(sA); // one tile
 
-    for (unsigned in = 0; in < Tn; ++in)
-    chess_prepare_for_pipelining chess_loop_range(1,) {
+    for (unsigned in = 0; in < Tn; ++in) {
+    // chess_prepare_for_pipelining chess_loop_range(1,) {
       MMUL C;
       const int8* __restrict pB = Bbase + in * MMUL::size_B;
 
@@ -120,50 +120,51 @@ void dense(
 // (Q @ K^T)  (T, d_model) @ (d_model, T) -> (T, T)
 template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int SHIFT_S>
 void attention(
-  input_stream_int8* __restrict q_head,
-  input_stream_int8* __restrict k_head,
-  output_stream_int8* __restrict scores_out
+  input_stream_int8* __restrict sQ,
+  input_stream_int8* __restrict sK,
+  output_stream_int8* __restrict sS
 ) {
+  // Note that matB = K^T
+
   using MMUL = aie::mmul<m, k, n, int8, int8>;
   using VA   = aie::vector<int8, MMUL::size_A>;
   using VB   = aie::vector<int8, MMUL::size_B>;
   using VC   = aie::vector<int8, MMUL::size_C>;
-  // --- stream K fully into a buffer (row-by-row)
-  alignas(aie::vector_decl_align) static int8 k_buf[T * d_model];
-  for (int r = 0; r < T; ++r) {
-    for (unsigned v = 0; v < vecs_per_row_B; ++v) {
-      VB tmp = readincr_v<MMUL::size_B>(k_head);
-      aie::store_v(&k_buf[r * d_model + v * MMUL::size_B], tmp);
-      printf("\nr = %d, v = %d, tmp = %d\n", r, v, tmp);
+
+  alignas(aie::vector_decl_align) VB matB[Tk*Tn];
+  constexpr unsigned strideB_perK = MMUL::size_B * Tn;
+  const int8* __restrict Bbase = (const int8*)matB;
+
+  for (unsigned in = 0; in < Tn; ++in) {
+  // chess_prepare_for_pipelining chess_loop_range(1,) {
+    for (unsigned ik = 0; ik < Tk; ++ik) {
+    // chess_prepare_for_pipelining chess_loop_range(1,) {
+      VB b = readincr_v<MMUL::size_B>(sK);
+      // VB bT = aie::transpose(b, n, k);
+      VB bT = b;
+      matB[ik*Tn+in] = bT;
     }
   }
 
-  // Iterate over M-tiles
-  for (unsigned im = 0; im < Tm; ++im)
-  chess_prepare_for_pipelining chess_loop_range(1,) {
+  for (unsigned im = 0; im < Tm; ++im) {
+  // chess_prepare_for_pipelining chess_loop_range(1,) {
     VA Abuf[Tk];
-    VB Bbuf[Tk];
-    for (unsigned ik = 0; ik < Tk; ++ik){
-      Abuf[ik] = readincr_v<MMUL::size_A>(q_head);
-      Bbuf[ik] = readincr_v<MMUL::size_B>(k_head);
+    for (unsigned ik = 0; ik < Tk; ++ik)
+      Abuf[ik] = readincr_v<MMUL::size_A>(sQ); // one tile
 
-      // N loop
-      for (unsigned in = 0; in < Tn; ++in)
-      chess_prepare_for_pipelining chess_loop_range(1,) {
-        MMUL C;
-        // const int8* __restrict pB = Bbase + in * MMUL::size_B;
+    for (unsigned in = 0; in < Tn; ++in) {
+    // chess_prepare_for_pipelining chess_loop_range(1,) {
+      MMUL C;
+      const int8* __restrict pB = Bbase + in * MMUL::size_B;
 
-        // ---- K loop
-        // for (unsigned ik = 0; ik < Tk; ++ik) {
-          // VB b = aie::load_v<MMUL::size_B>(pB + ik * strideB_perK);
-          // if (ik == 0) C.mul(Abuf[0], Bbuf[0]);
-          // else         C.mac(Abuf[ik], Bbuf[ik]);
-        // }
-
-        VC v = C.template to_vector<int8>(SHIFT_S);
-        writeincr(scores_out, v);
-        printf("\n\nAbuf[%d] = %d\nBbuf[%d] = %d\nscores_out = %d\n\n", Tm, Tn, ik, Abuf[ik], ik, Bbuf[ik], v);
+      for (unsigned ik = 0; ik < Tk; ++ik) {//row of B
+        VB b = matB[ik*Tn];
+        if (ik == 0) C.mul(Abuf[0], b);
+        else         C.mac(Abuf[ik], b);
       }
+
+      VC v = C.template to_vector<int8>(SHIFT_S);
+      writeincr(sS, v);
     }
   }
 }
@@ -171,15 +172,49 @@ void attention(
 // (scores @ V)  (T,T) @ (T,d_model) -> (T,d_model)
 template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT>
 void head(
-  input_stream_int8 * __restrict scores_in,
-  output_stream_int8 * __restrict context_out,
-  input_stream_int8 * __restrict v_in
+  input_stream_int8 * __restrict sS,
+  output_stream_int8 * __restrict sC,
+  input_stream_int8 * __restrict sV
 ) {
   using MMUL = aie::mmul<m, k, n, int8, int8>;
   using VA   = aie::vector<int8, MMUL::size_A>;
   using VB   = aie::vector<int8, MMUL::size_B>;
   using VC   = aie::vector<int8, MMUL::size_C>;
 
+  // Note that matB = buffer for V
+  alignas(aie::vector_decl_align) VB matB[Tk*Tn];
+  constexpr unsigned strideB_perK = MMUL::size_B * Tn;
+  const int8* __restrict Bbase = (const int8*)matB;
+
+  for (unsigned ik = 0; ik < Tk; ++ik) {
+  // chess_prepare_for_pipelining chess_loop_range(1,) {
+    for (unsigned in = 0; in < Tn; ++in) {
+    // chess_prepare_for_pipelining chess_loop_range(1,) {
+      matB[ik*Tn+in] = readincr_v<MMUL::size_B>(sV);
+    }
+  }
+
+  for (unsigned im = 0; im < Tm; ++im) {
+  // chess_prepare_for_pipelining chess_loop_range(1,) {
+    VA Abuf[Tk];
+    for (unsigned ik = 0; ik < Tk; ++ik)
+      Abuf[ik] = readincr_v<MMUL::size_A>(sS); // one tile
+
+    for (unsigned in = 0; in < Tn; ++in) {
+    // chess_prepare_for_pipelining chess_loop_range(1,) {
+      MMUL C;
+      const int8* __restrict pB = Bbase + in * MMUL::size_B;
+
+      for (unsigned ik = 0; ik < Tk; ++ik) {//row of B
+        VB b = matB[ik*Tn];
+        if (ik == 0) C.mul(Abuf[0], b);
+        else         C.mac(Abuf[ik], b);
+      }
+
+      VC v = C.template to_vector<int8>(SHIFT);
+      writeincr(sC, v);
+    }
+  }
 
 }
 

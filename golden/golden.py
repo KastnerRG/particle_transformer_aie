@@ -94,11 +94,11 @@ def golden_fc(x, k, is_relu, shift):
 
 def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iterations):
      # Generate weights & intermediate input/output matrices
-    Wq_tiled   = tile_matrix(pad_rows(layer_q["k"]), k, n)
-    Wk_tiled   = tile_matrix(pad_rows(layer_k["k"]), k, n)
-    Wv_tiled   = tile_matrix(pad_rows(layer_v["k"]), k, n)
-    Wo_tiled   = tile_matrix(pad_rows(layer_o["k"]), k, n)
-    out_x_tiled = tile_matrix(pad_rows(layer_o["x"]), m, k)
+    Wq_tiled   = tile_matrix(layer_q["k"], k, n)
+    Wk_tiled   = tile_matrix(layer_k["k"], k, n)
+    Wv_tiled   = tile_matrix(layer_v["k"], k, n)
+    Wo_tiled   = tile_matrix(layer_o["k"], k, n)
+    out_x_tiled = tile_matrix(layer_o["x"], m, k)
 
     np.savetxt(f"data/mha_Wq{idx}.txt", layer_q["k"], fmt="%d")
     np.savetxt(f"data/mha_Wk{idx}.txt", layer_k["k"], fmt="%d")
@@ -106,8 +106,6 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
     np.savetxt(f"data/mha_Wo{idx}.txt", layer_o["k"], fmt="%d")
     np.savetxt(f"data/out_x{idx}.txt", np.tile(out_x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
 
-    # pad input
-    layer_q["x"] = pad_rows(layer_q["x"], target_rows=160)
     x_tiled = tile_matrix(layer_q["x"], m, k)
     # a_tiled = tile_matrix(layer_o["a"], m, n)
     np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
@@ -118,7 +116,7 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
     n = 8
     num_heads = 1
     d_model = 64
-    T = 160 # first dimension of input to mha
+    T = 160
     SHIFT_Q = 10
     SHIFT_K = 11
     SHIFT_V = 11
@@ -181,7 +179,7 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wo_tiled.size}] = {{ 
 
 #include "kernels.h"
 
-void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ output<{m}, {k}, {n}, {d_model}, {T}, {SHIFT_O}>(x, a, k_p);}}
+void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {d_model//n}, {SHIFT_O}, true>(x, a, k_p);}}
 ''')
     
     # in_bytes = layer_q['x'].size * layer_q['x'].itemsize
@@ -244,18 +242,19 @@ if __name__ == "__main__":
     # Keras-like dims
     in_particles, num_feature, ff_dim = 150, 3, 64
     num_feature_pad = 8   # pad to multiple of 8 for AIE tiling
-
+    num_particles_pad = 160 # pad to multiple of 8 for AIE tiling in mha layer.
     ###################################################################### below is layer 1
     # ---- Input + padding (3 -> 8) ----
     dummy_inp = rng.integers(-128, 128, size=(in_particles, num_feature), dtype=np.int8)
-    pad_inp   = np.zeros((in_particles, num_feature_pad), dtype=np.int8)
-    pad_inp[:, :num_feature] = dummy_inp
+    pad_inp   = np.zeros((num_particles_pad, num_feature_pad), dtype=np.int8)
+    pad_inp[:in_particles, :num_feature] = dummy_inp
 
-    # ---- Dense to reach MHA width: (150,8) · (8,64) -> (150,64) ----
+    # ---- Dense to reach MHA width: (160,8) · (8,64) -> (160,64) ----
     W_fc1 = rng.integers(-128, 128, size=(num_feature_pad, ff_dim), dtype=np.int8)
     a1, L1 = golden_fc(pad_inp, W_fc1, is_relu=True, shift=2)
     layers += L1
 
+    
     # ---- MHA 1 + residual ----
     numheads = 1 #4
     Wq = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
@@ -269,7 +268,7 @@ if __name__ == "__main__":
     mha1 = NumpyMHALinear(d_model=ff_dim, num_heads=numheads, name_prefix="mha1", seed=seed, Wq=Wq, Wk=Wk, Wv=Wv, Wo=Wo)
     att1 = mha1(a1, a1, a1, layers=layers)      # self-attention: Q=K=V=a1
     # a2   = residual_add_int8(att1, a1)          # Add()([x, emb])
-
+    
     # ###################################################################### below is layer 2
     # # ---- Two dense (FF) + residual (Block 1) ----
     # W_ff1a = np.random.randint(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
