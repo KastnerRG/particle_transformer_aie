@@ -31,6 +31,7 @@ def process_dense_layer(idx, layer, m, k, n, iterations):
     np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
     np.savetxt(f"data/a{idx}.txt", np.tile(a_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
 
+
     t_m = layer['x'].shape[0] // m
     t_k = layer['x'].shape[1] // k
     t_n = layer['k'].shape[1] // n
@@ -106,6 +107,7 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
     np.savetxt(f"data/mha_Wo{idx}.txt", layer_o["k"], fmt="%d")
     np.savetxt(f"data/out_x{idx}.txt", np.tile(out_x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
 
+
     x_tiled = tile_matrix(layer_q["x"], m, k)
     # a_tiled = tile_matrix(layer_o["a"], m, n)
     np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
@@ -116,7 +118,7 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
     n = 8
     num_heads = 1
     d_model = 64
-    T = 160
+    T = 160 # first dimension of input to mha
     SHIFT_Q = 10
     SHIFT_K = 11
     SHIFT_V = 11
@@ -252,6 +254,7 @@ if __name__ == "__main__":
     # ---- Dense to reach MHA width: (160,8) · (8,64) -> (160,64) ----
     W_fc1 = rng.integers(-128, 128, size=(num_feature_pad, ff_dim), dtype=np.int8)
     a1, L1 = golden_fc(pad_inp, W_fc1, is_relu=True, shift=2)
+    print(f"Dense: x_in = {pad_inp.shape}, W = {W_fc1.shape}, x_out = {a1.shape}")
     layers += L1
 
     

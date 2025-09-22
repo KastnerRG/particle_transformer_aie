@@ -139,10 +139,8 @@ void attention(
   // chess_prepare_for_pipelining chess_loop_range(1,) {
     for (unsigned ik = 0; ik < Tk; ++ik) {
     // chess_prepare_for_pipelining chess_loop_range(1,) {
-      VB b = readincr_v<MMUL::size_B>(sK);
-      // VB bT = aie::transpose(b, n, k);
-      VB bT = b;
-      matB[ik*Tn+in] = bT;
+      matB[ik*Tn+in] = readincr_v<MMUL::size_B>(sK);
+      matB[ik*Tn+in] = aie::transpose(matB[ik*Tn+in], n, k);
     }
   }
 
