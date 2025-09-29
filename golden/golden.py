@@ -113,7 +113,7 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
     np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
     # np.savetxt(f"data/a{idx}.txt", np.tile(a_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
 
-    m = 2
+    m = 4
     k = 8
     n = 8
     num_heads = 1
@@ -163,7 +163,7 @@ void v{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a)
         f.write(f'''
 #include "kernels.h"
 
-void attn{idx}(output_stream_int8 * __restrict o_head, input_stream_int8 * __restrict q_head, input_stream_int8 * __restrict k_head){{ attention<{m}, {k}, {n}, {T//m}, {d_model//k}, {T//n}, {d_model}, {T}, {SHIFT_S}>(q_head, k_head, o_head);}}
+void attn{idx}(input_stream_int8 * __restrict q_head, input_stream_int8 * __restrict k_head, output_stream_int8 * __restrict o_head){{ attention<{m}, {k}, {n}, {T//m}, {d_model//k}, {d_model//n}, {d_model}, {T}, {SHIFT_S}>(q_head, k_head, o_head);}}
 ''')
     # head = (scores @ V) (160,160)@(160,64) TODO: repeat for each head
     with open(f"aie/layer_{idx}_head.cc", "a") as f:
@@ -314,7 +314,7 @@ if __name__ == "__main__":
 
 
 
-    m, k, n = 2,8,8 # k==n such that output matrix can be fed as input without re-tiling
+    m, k, n = 4,8,8 # k==n such that output matrix can be fed as input without re-tiling
     iterations = 1
 
     # 0. Do a cleanup
