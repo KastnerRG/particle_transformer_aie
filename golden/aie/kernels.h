@@ -129,11 +129,16 @@ void attention(
   using VA   = aie::vector<int8, MMUL::size_A>;
   using VB   = aie::vector<int8, MMUL::size_B>;
   using VC   = aie::vector<int8, MMUL::size_C>;
-  VB matB[Tm*Tn];
+
+  alignas(aie::vector_decl_align) int8 k_buffer[Tm * Tn * MMUL::size_A];
+  const int8* __restrict k_base = (const int8*)k_buffer;
+  unsigned int ratio = k/m;
 
   for (unsigned im = 0; im < Tm; ++im) { // rows
-    for (unsigned in = 0; in < Tn; ++in) { // columns
-      matB[in*Tm+in] = aie::transpose(readincr_v<MMUL::size_B>(sK), m, n); //curr row + curr column
+    const int8* pK = k_base + ratio*(im/ratio)*Tk*MMUL::size_A+(im%ratio)*MMUL::size_A;
+    for (unsigned ik = 0; ik < Tk; ++ik) { // columns
+      VA k_mxk = readincr_v<MMUL::size_A>(sK);
+      aie::store_v(pK + ik*MMUL::size_B, k_mxk);
     }
   }
   
@@ -142,12 +147,17 @@ void attention(
   for (unsigned im = 0; im < Tm; ++im) {   // rows of Q and K
     VA Abuf[Tn]; // row of tiles
     MMUL C;
-    for (unsigned in = 0; in < Tn; ++in) { // columns of Q
-      Abuf[in] = readincr_v<MMUL::size_A>(sQ);
+    for (unsigned ik = 0; ik < Tk; ++ik) { // columns of Q
+      Abuf[ik] = readincr_v<MMUL::size_A>(sQ);
     }
-    for (unsigned in = 0; in < Tn; ++in) { // columns of K
-      if (in == 0) C.mul(Abuf[0], matB[im*Tn+in]);
-      else         C.mac(Abuf[in], matB[im*Tn+in]);
+    for (unsigned in = 0; in < Tn; ++in) { // rows of K correspond to tile-wise columns of K^T
+      const int8* __restrict pB = k_base + in*Tk*MMUL::size_B;
+      for (unsigned ik = 0; ik < Tk; ++ik) { // columns of K
+        VB b = aie::transpose(aie::load_v<MMUL::size_B>(pB+ik*MMUL::size_B), n, k);
+
+        if (in == 0) C.mul(Abuf[0], b);
+        else         C.mac(Abuf[in], b);
+      }
     }
     VC V = C.template to_vector<int8>(SHIFT_S);
     writeincr(sS, V);
