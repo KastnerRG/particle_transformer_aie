@@ -13,8 +13,8 @@ v++ -c \
   --platform $XILINX_VITIS/base_platforms/xilinx_vck190_base_202410_1/xilinx_vck190_base_202410_1.xpfm \
   --work_dir ./Work \
   --target hw \
-  --aie.heapsize=16000 \
-  --aie.stacksize=16000 \
+  --aie.heapsize=6000 \
+  --aie.stacksize=26000 \
   aie/graph.cpp
   # --aie.xlopt=2 \
   # --aie.Xxloptstr="-annotate-pragma" \
@@ -22,4 +22,5 @@ v++ -c \
 aiesimulator \
   --profile \
   --dump-vcd=aiesim \
+  --hang-detect-time=5000000 \
   --pkg-dir=./Work

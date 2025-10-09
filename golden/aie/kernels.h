@@ -89,6 +89,7 @@ void dense(
   using VA   = aie::vector<int8, MMUL::size_A>;
   using VB   = aie::vector<int8, MMUL::size_B>;
   using VC   = aie::vector<int8, MMUL::size_C>;
+  int count = 0;
   
   const int8* __restrict Bbase = (const int8*)matB;
   const unsigned strideB_perK  = MMUL::size_B * Tn; // row length
@@ -113,8 +114,10 @@ void dense(
       VC v = C.template to_vector<int8>(SHIFT);
       if (is_relu) v = aie::max(v, (int8)0);
       writeincr(sC, v);
+      count++;
     }
   }
+  printf("\ncount = [%d]", count);
 }
 
 // (Q @ K^T)  (T, d_model) @ (T, d_model)^T -> (T, T)
@@ -130,74 +133,86 @@ void attention(
   using VB   = aie::vector<int8, MMUL::size_B>;
   using VC   = aie::vector<int8, MMUL::size_C>;
   VB matB[Tm*Tn];
-
+  printf("testing attn"); //stalls after this
   for (unsigned im = 0; im < Tm; ++im) { // rows
     for (unsigned in = 0; in < Tn; ++in) { // columns
-      matB[in*Tm+in] = aie::transpose(readincr_v<MMUL::size_B>(sK), m, n); //curr row + curr column
+      matB[in*Tm+in] = aie::transpose(readincr_v<MMUL::size_B>(sK), m, n);
     }
+  }
+  printf("filled matB");
+  for (int i = 0; i < 8; ++i) { // limit to 8 elements
+    printf("\nmatB[%d] = %d\n", i, matB[i]);
   }
   
   //int8* pQ = sQ.data(); // (160,64)
   //int8* pK = sK.data(); // (160,64)
-  for (unsigned im = 0; im < Tm; ++im) {   // rows of Q and K
+  for (unsigned im = 0; im < Tm; ++im) {   // rows of Q
     VA Abuf[Tn]; // row of tiles
-    MMUL C;
     for (unsigned in = 0; in < Tn; ++in) { // columns of Q
       Abuf[in] = readincr_v<MMUL::size_A>(sQ);
     }
-    for (unsigned in = 0; in < Tn; ++in) { // columns of K
-      if (in == 0) C.mul(Abuf[0], matB[im*Tn+in]);
-      else         C.mac(Abuf[in], matB[im*Tn+in]);
+    for (unsigned im = 0; im < Tm; ++im) { // rows of K
+      MMUL C;
+      for (unsigned in = 0; in < Tn; ++in) { // columns of K
+        if (in == 0) C.mul(Abuf[0], matB[im*Tn+in]);
+        else         C.mac(Abuf[in], matB[im*Tn+in]);
+      }
+      VC V = C.template to_vector<int8>(SHIFT_S);
+      writeincr(sS, V);
     }
-    VC V = C.template to_vector<int8>(SHIFT_S);
-    writeincr(sS, V);
   }
+
 }
 
-// (scores @ V)  (T,T) @ (T,d_model) -> (T,d_model)
+// (scores @ V)  (T,T) @ (T,d_model) -> (T,d_model) mxk
 template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT>
 void head(
   input_stream_int8 * __restrict sS,
-  output_stream_int8 * __restrict sC,
-  input_stream_int8 * __restrict sV
+  input_stream_int8 * __restrict sV,
+  output_stream_int8 * __restrict sC
 ) {
-  using MMUL = aie::mmul<m, k, n, int8, int8>;
-  using VA   = aie::vector<int8, MMUL::size_A>;
-  using VB   = aie::vector<int8, MMUL::size_B>;
-  using VC   = aie::vector<int8, MMUL::size_C>;
+  using MMUL = aie::mmul<m, m, n, int8, int16>; // 4x4x8 -> 4x8
+  using VA   = aie::vector<int8,  MMUL::size_A>; // mxm (int8)
+  using VB   = aie::vector<int16, MMUL::size_B>; // mxn (int16)
+  using VC   = aie::vector<int16, MMUL::size_C>; // mxn (int16)
 
-  // Note that matB = buffer for V
-  alignas(aie::vector_decl_align) VB matB[Tk*Tn];
-  constexpr unsigned strideB_perK = MMUL::size_B * Tn;
-  const int8* __restrict Bbase = (const int8*)matB;
+  // using MMUL_temp = aie::mmul<m, n, n, int8, int8>; // 4x8x8
+  using VBin = aie::vector<int8, MMUL::size_B>; // 4x8 (int8)
+  using VCout = aie::vector<int8, MMUL::size_C>;
 
-  for (unsigned ik = 0; ik < Tk; ++ik) {
-  // chess_prepare_for_pipelining chess_loop_range(1,) {
-    for (unsigned in = 0; in < Tn; ++in) {
-    // chess_prepare_for_pipelining chess_loop_range(1,) {
-      matB[ik*Tn+in] = readincr_v<MMUL::size_B>(sV);
+  VB matB[Tm*Tn];
+
+  for (unsigned im = 0; im < Tm; ++im) { // rows
+    for (unsigned in = 0; in < Tn; ++in) { // columns
+      VBin B = readincr_v<32>(sV);
+      VB B16 = B.unpack();
+      matB[in*Tm+in] = B16; //convert to int16 for 4x4x8
     }
   }
 
+  const int16* __restrict Bbase = (const int16*)matB;
+  const unsigned strideB_perK  = MMUL::size_B * Tn; // row length
+
   for (unsigned im = 0; im < Tm; ++im) {
   // chess_prepare_for_pipelining chess_loop_range(1,) {
-    VA Abuf[Tk];
-    for (unsigned ik = 0; ik < Tk; ++ik)
-      Abuf[ik] = readincr_v<MMUL::size_A>(sS); // one tile
-
+    VA Abuf[Tm];
+    for (unsigned im = 0; im < Tm; ++im) {
+      Abuf[im] = readincr_v<MMUL::size_A>(sS); // one tile
+    }
     for (unsigned in = 0; in < Tn; ++in) {
     // chess_prepare_for_pipelining chess_loop_range(1,) {
       MMUL C;
-      const int8* __restrict pB = Bbase + in * MMUL::size_B;
+      const int16* __restrict pB  = Bbase + in * MMUL::size_B;
 
-      for (unsigned ik = 0; ik < Tk; ++ik) {//row of B
-        VB b = matB[ik*Tn];
-        if (ik == 0) C.mul(Abuf[0], b);
-        else         C.mac(Abuf[ik], b);
+      for (unsigned im = 0; im < Tm; ++im) {//row of B
+        VB b = aie::load_v<MMUL::size_B>(pB + im * strideB_perK);
+        if (im == 0) C.mul(Abuf[0], b);
+        else         C.mac(Abuf[im], b);
       }
 
-      VC v = C.template to_vector<int8>(SHIFT);
-      writeincr(sC, v);
+      VC v = C.template to_vector<int16>(SHIFT);
+      VCout vout = v.pack();
+      writeincr(sC, vout);
     }
   }
 

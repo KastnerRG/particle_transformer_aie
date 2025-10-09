@@ -170,7 +170,7 @@ void attn{idx}(input_stream_int8 * __restrict q_head, input_stream_int8 * __rest
         f.write(f'''
 #include "kernels.h"
 
-void head{idx}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ head<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}>(x, a, v);}}
+void head{idx}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ head<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}>(x, v, a);}}
 ''')
     head_idx = 0
     # (concatenated heads @ Wo) (160,64)@(64,64)
@@ -346,7 +346,7 @@ if __name__ == "__main__":
         f.write(f'void q{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
         f.write(f'void k{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
         f.write(f'void v{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
-        f.write(f'void attn{1}(output_stream_int8 * __restrict, input_stream_int8 * __restrict, input_stream_int8 * __restrict);\n')
+        f.write(f'void attn{1}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
         f.write(f'void head{1}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
         f.write(f'void out{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
 
