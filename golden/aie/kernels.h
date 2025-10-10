@@ -129,14 +129,15 @@ void attention(
   output_stream_int8 * __restrict sS
 ) {
   using MMUL = aie::mmul<m, n, m, int8, int8>; // 4x8x4
-  using VA   = aie::vector<int8, MMUL::size_A>;
-  using VB   = aie::vector<int8, MMUL::size_B>;
-  using VC   = aie::vector<int8, MMUL::size_C>;
+  using VA   = aie::vector<int8, MMUL::size_A>; // 4x8
+  using VB   = aie::vector<int8, MMUL::size_A>; // 8x4
+  using VC   = aie::vector<int8, MMUL::size_C>; // 4x4
+
   VB matB[Tm*Tn];
   printf("testing attn"); //stalls after this
   for (unsigned im = 0; im < Tm; ++im) { // rows
     for (unsigned in = 0; in < Tn; ++in) { // columns
-      matB[in*Tm+in] = aie::transpose(readincr_v<MMUL::size_B>(sK), m, n);
+      matB[in*Tm+im] = aie::transpose(readincr_v<MMUL::size_A>(sK), m, n);
     }
   }
   printf("filled matB");
@@ -151,11 +152,11 @@ void attention(
     for (unsigned in = 0; in < Tn; ++in) { // columns of Q
       Abuf[in] = readincr_v<MMUL::size_A>(sQ);
     }
-    for (unsigned im = 0; im < Tm; ++im) { // rows of K
+    for (unsigned jm = 0; jm < Tm; ++jm) { // rows of K
       MMUL C;
       for (unsigned in = 0; in < Tn; ++in) { // columns of K
-        if (in == 0) C.mul(Abuf[0], matB[im*Tn+in]);
-        else         C.mac(Abuf[in], matB[im*Tn+in]);
+        if (in == 0) C.mul(Abuf[0], matB[in*Tm+jm]);
+        else         C.mac(Abuf[in], matB[in*Tm+jm]);
       }
       VC V = C.template to_vector<int8>(SHIFT_S);
       writeincr(sS, V);
@@ -165,6 +166,8 @@ void attention(
 }
 
 // (scores @ V)  (T,T) @ (T,d_model) -> (T,d_model) mxk
+// Tm = 160/4 = 40, Tk = 160/4 = 20, Tn = 64/8 = 8
+// 160 x 160 x 64 tiled with 4 x 4 x 8
 template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT>
 void head(
   input_stream_int8 * __restrict sS,
@@ -176,7 +179,6 @@ void head(
   using VB   = aie::vector<int16, MMUL::size_B>; // mxn (int16)
   using VC   = aie::vector<int16, MMUL::size_C>; // mxn (int16)
 
-  // using MMUL_temp = aie::mmul<m, n, n, int8, int8>; // 4x8x8
   using VBin = aie::vector<int8, MMUL::size_B>; // 4x8 (int8)
   using VCout = aie::vector<int8, MMUL::size_C>;
 
@@ -186,28 +188,23 @@ void head(
     for (unsigned in = 0; in < Tn; ++in) { // columns
       VBin B = readincr_v<32>(sV);
       VB B16 = B.unpack();
-      matB[in*Tm+in] = B16; //convert to int16 for 4x4x8
+      matB[im*Tn+in] = B16; //convert to int16 for 4x4x8
     }
   }
-
-  const int16* __restrict Bbase = (const int16*)matB;
-  const unsigned strideB_perK  = MMUL::size_B * Tn; // row length
 
   for (unsigned im = 0; im < Tm; ++im) {
   // chess_prepare_for_pipelining chess_loop_range(1,) {
     VA Abuf[Tm];
-    for (unsigned im = 0; im < Tm; ++im) {
-      Abuf[im] = readincr_v<MMUL::size_A>(sS); // one tile
+    for (unsigned jm = 0; jm < Tm; ++jm) {
+      Abuf[jm] = readincr_v<MMUL::size_A>(sS); // one tile
     }
     for (unsigned in = 0; in < Tn; ++in) {
     // chess_prepare_for_pipelining chess_loop_range(1,) {
       MMUL C;
-      const int16* __restrict pB  = Bbase + in * MMUL::size_B;
-
-      for (unsigned im = 0; im < Tm; ++im) {//row of B
-        VB b = aie::load_v<MMUL::size_B>(pB + im * strideB_perK);
-        if (im == 0) C.mul(Abuf[0], b);
-        else         C.mac(Abuf[im], b);
+      for (unsigned jm = 0; jm < Tm; ++jm) {//row of B
+        VB b = matB[jm*Tn+in];
+        if (jm == 0) C.mul(Abuf[0], b);
+        else         C.mac(Abuf[jm], b);
       }
 
       VC v = C.template to_vector<int16>(SHIFT);
@@ -215,7 +212,6 @@ void head(
       writeincr(sC, vout);
     }
   }
-
 }
 
 
