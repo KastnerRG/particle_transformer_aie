@@ -81,9 +81,9 @@
 
 template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT, bool is_relu>
 void dense(
-  input_stream_int8 * __restrict sA, 
+  input_stream_int8 * __restrict sA,
   output_stream_int8 * __restrict sC,
-  const int8 matB [] // Tk x Tn, k x n
+  const int8 matB []
   ) {
   using MMUL = aie::mmul<m, k, n, int8, int8>; // m = 4, k = 8, n = 8
   using VA   = aie::vector<int8, MMUL::size_A>;
@@ -117,11 +117,10 @@ void dense(
       count++;
     }
   }
-  printf("\ncount = [%d]", count);
 }
 
-// (Q @ K^T)  (T, d_model) @ (T, d_model)^T -> (T, T)
-// m = 4, k = 8, n = 8, Tm (rows) = 160 / m = 40, Tn (columns) = 64 / n = 8
+// (Q @ K^T):  (T, d_model) @ (T, d_model)^T -> (T, T)
+// m=4, k=8, n=8, T=160, d_model=64, Tm(rows)=160/m=40, Tn(columns)=64/n=8
 template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int SHIFT_S>
 void attention(
   input_stream_int8 * __restrict sQ, // adf::input_buffer<int8, adf::extents<T*d_model>> & sQ,
@@ -133,20 +132,15 @@ void attention(
   using VB   = aie::vector<int8, MMUL::size_A>; // 8x4
   using VC   = aie::vector<int8, MMUL::size_C>; // 4x4
 
-  VB matB[Tm*Tn];
-  printf("testing attn"); //stalls after this
-  for (unsigned im = 0; im < Tm; ++im) { // rows
-    for (unsigned in = 0; in < Tn; ++in) { // columns
-      matB[in*Tm+im] = aie::transpose(readincr_v<MMUL::size_A>(sK), m, n);
+  VB matB[Tm*Tn]; //store all of matB in mem
+
+  for (unsigned i = 0; i < Tm; ++i) { // rows
+    for (unsigned j = 0; j < Tn; ++j) { // columns
+      matB[i*Tm+j] = aie::transpose(readincr_v<MMUL::size_A>(sK), m, n);
     }
   }
-  printf("filled matB");
-  for (int i = 0; i < 8; ++i) { // limit to 8 elements
-    printf("\nmatB[%d] = %d\n", i, matB[i]);
-  }
   
-  //int8* pQ = sQ.data(); // (160,64)
-  //int8* pK = sK.data(); // (160,64)
+  // row by row multiplication
   for (unsigned im = 0; im < Tm; ++im) {   // rows of Q
     VA Abuf[Tn]; // row of tiles
     for (unsigned in = 0; in < Tn; ++in) { // columns of Q
@@ -155,14 +149,13 @@ void attention(
     for (unsigned jm = 0; jm < Tm; ++jm) { // rows of K
       MMUL C;
       for (unsigned in = 0; in < Tn; ++in) { // columns of K
-        if (in == 0) C.mul(Abuf[0], matB[in*Tm+jm]);
-        else         C.mac(Abuf[in], matB[in*Tm+jm]);
+        if (in == 0) C.mul(Abuf[0], matB[jm*Tm+in]);
+        else         C.mac(Abuf[in], matB[jm*Tm+in]);
       }
       VC V = C.template to_vector<int8>(SHIFT_S);
       writeincr(sS, V);
     }
   }
-
 }
 
 // (scores @ V)  (T,T) @ (T,d_model) -> (T,d_model) mxk
@@ -186,7 +179,7 @@ void head(
 
   for (unsigned im = 0; im < Tm; ++im) { // rows
     for (unsigned in = 0; in < Tn; ++in) { // columns
-      VBin B = readincr_v<32>(sV);
+      VBin B = readincr_v<32>(sV); // 4x8
       VB B16 = B.unpack();
       matB[im*Tn+in] = B16; //convert to int16 for 4x4x8
     }
