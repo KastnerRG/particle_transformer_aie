@@ -181,7 +181,7 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wo_tiled.size}] = {{ 
 
 #include "kernels.h"
 
-void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {d_model//n}, {SHIFT_O}, true>(x, a, k_p);}}
+void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {d_model//n}, {SHIFT_O}, false>(x, a, k_p);}}
 ''')
     
     # in_bytes = layer_q['x'].size * layer_q['x'].itemsize
