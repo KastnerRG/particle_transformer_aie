@@ -136,7 +136,7 @@ void attention(
 
   for (unsigned i = 0; i < Tm; ++i) { // rows
     for (unsigned j = 0; j < Tn; ++j) { // columns
-      matB[i*Tm+j] = aie::transpose(readincr_v<MMUL::size_A>(sK), m, n);
+      matB[i*Tn+j] = aie::transpose(readincr_v<MMUL::size_A>(sK), m, n);
     }
   }
   
@@ -149,8 +149,8 @@ void attention(
     for (unsigned jm = 0; jm < Tm; ++jm) { // rows of K
       MMUL C;
       for (unsigned in = 0; in < Tn; ++in) { // columns of K
-        if (in == 0) C.mul(Abuf[0], matB[jm*Tm+in]);
-        else         C.mac(Abuf[in], matB[jm*Tm+in]);
+        if (in == 0) C.mul(Abuf[0], matB[jm*Tn+in]);
+        else         C.mac(Abuf[in], matB[jm*Tn+in]);
       }
       VC V = C.template to_vector<int8>(SHIFT_S);
       writeincr(sS, V);
@@ -195,9 +195,8 @@ void head(
     // chess_prepare_for_pipelining chess_loop_range(1,) {
       MMUL C;
       for (unsigned jm = 0; jm < Tm; ++jm) {//row of B
-        VB b = matB[jm*Tn+in];
-        if (jm == 0) C.mul(Abuf[0], b);
-        else         C.mac(Abuf[jm], b);
+        if (jm == 0) C.mul(Abuf[0], matB[jm*Tn+in]);
+        else         C.mac(Abuf[jm], matB[jm*Tn+in]);
       }
 
       VC v = C.template to_vector<int16>(SHIFT);

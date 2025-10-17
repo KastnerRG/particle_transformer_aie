@@ -218,9 +218,10 @@ void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict 
         f.write(f"mha[{4}] = kernel::create(head{idx});\n")
         f.write(f'source(mha[{4}]) = "layer_{idx}_head.cc";\n')
         f.write(f'runtime<ratio>(mha[{4}]) = 1.0;\n')
-        f.write(f"connect<stream>(mha[{3}].out[0], mha[{4}].in[0]);\n") #sS
-        f.write(f"connect<stream> s2(mha[{2}].out[0], mha[{4}].in[1]);\n") #sV
-        f.write(f"fifo_depth(s2) = {int(T*d_model/4)};\n\n")
+        f.write(f"connect<stream> s2(mha[{3}].out[0], mha[{4}].in[0]);\n") #sS
+        f.write(f"fifo_depth(s2) = {int(T*d_model/4)};\n")
+        f.write(f"connect<stream>(mha[{2}].out[0], mha[{4}].in[1]);\n\n") #sV
+
 
         f.write(f"mha[{5}] = kernel::create(out{idx});\n")
         f.write(f'source(mha[{5}]) = "layer_{idx}_out.cc";\n')
