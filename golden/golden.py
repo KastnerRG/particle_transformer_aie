@@ -49,20 +49,7 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{k_tiled.size}] = {{ {
 
 void f{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu}> (x, a, k_p);}}
 ''')
-
-
-    # model.cc - each layer as function
-
-
-
-    # with open("aie/model.cc", "a") as f:
-    #     f.write(f"void f{idx}(input_window_int8* __restrict x, output_window_int8 * __restrict a) ")
-    #     f.write(f"{{ dense<{m}, {k}, {n}, {t_m}, {t_k}, {t_n}, {shift}, {is_relu}> (x, a, k{idx}); }}\n")
-
-    # model.h - Function prototypes
-
-    # with open("aie/model.h", "a") as f:
-    #     f.write(f"void f{idx}( input_window_int8  * __restrict, output_window_int8 * __restrict);\n")
+        
 
     # layer_graph.h - create and connect layers
 
@@ -181,16 +168,11 @@ __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wo_tiled.size}] = {{ 
 
 #include "kernels.h"
 
-void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {d_model//n}, {SHIFT_O}, false>(x, a, k_p);}}
+void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {d_model//n}, {SHIFT_O}, true>(x, a, k_p);}}
 ''')
     
-    # in_bytes = layer_q['x'].size * layer_q['x'].itemsize
+
     in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
-    # q_bytes = layer_q['a'].size * layer_q['a'].itemsize
-    # k_bytes = layer_k['a'].size * layer_k['a'].itemsize
-    # v_bytes = layer_v['a'].size * layer_v['a'].itemsize
-    # attn_bytes = T*T # large window size causes memory error
-    # head_bytes = layer_o['x'].size * layer_o['x'].itemsize
 
     with open("aie/layer_graph.h", "a") as f: # TODO: set mha index properly
         f.write(f"mha[{0}] = kernel::create(q{idx});\n")
@@ -257,7 +239,7 @@ if __name__ == "__main__":
     # ---- Dense to reach MHA width: (160,8) · (8,64) -> (160,64) ----
     W_fc1 = rng.integers(-128, 128, size=(num_feature_pad, ff_dim), dtype=np.int8)
     a1, L1 = golden_fc(pad_inp, W_fc1, is_relu=True, shift=2)
-    print(f"Dense: x_in = {pad_inp.shape}, W = {W_fc1.shape}, x_out = {a1.shape}")
+    # print(f"Dense: x_in = {pad_inp.shape}, W = {W_fc1.shape}, x_out = {a1.shape}")
     layers += L1
 
     
@@ -353,13 +335,7 @@ if __name__ == "__main__":
         f.write(f'void head{1}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
         f.write(f'void out{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
 
-    # 2. Preamble of model.cc - each layer as function
-
-    # with open("aie/model.cc", "w") as f:
-    #     f.write('#include "kernels.h"\n#include "weights.h"\n')
-
-
-    # 3. Process each layer: write weights.h, x.txt, a.txt, model.cc, model.h, layer_graph.h
+    # 2. Process each layer: write weights.h, x.txt, a.txt, layer_graph.h
 
     process_dense_layer(0, layers[0], m, k, n, iterations)
     process_mha_layer(1, m, k, n, layers[1], layers[2], layers[3], layers[4], iterations)
@@ -367,18 +343,18 @@ if __name__ == "__main__":
     tiled_mat = tile_matrix(layers[-1]['a'], m, n)
     np.savetxt("data/out_ref.txt", np.tile(tiled_mat, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
 
-    # 4. Postamble of layer_graph.h - connect last layer to AIE_OUT
+    # 3. Postamble of layer_graph.h - connect last layer to AIE_OUT
     
     out_bytes = layers[-1]['a'].size * layers[-1]['a'].itemsize
     with open("aie/layer_graph.h", "a") as f:
         f.write(f"connect<stream>(mha[{5}].out[0], AIE_OUT.in[0]);\n")    
 
-    # 5. Run AIE (graph.cpp)
+    # 4. Run AIE (graph.cpp)
 
     subprocess.run(["./run.sh"], check=True)
 
 
-    # 6. Verify output
+    # 5. Verify output
 
     aie_out_path = "aiesimulator_output/data/out_sim.txt"
     assert os.path.exists(aie_out_path), f"Error: Output file {aie_out_path} does not exist."

@@ -5,6 +5,7 @@
 /aiesimulator_output
 /.Xil
 /Work
+/utils/__pycache__/*
 ISS_RPC_SERVER_PORT
 Map_Report.csv
 pl_sample_counts

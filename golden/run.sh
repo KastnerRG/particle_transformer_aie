@@ -22,6 +22,6 @@ v++ -c \
 aiesimulator \
   --profile \
   --dump-vcd=aiesim \
-  --hang-detect-time=5000000 \
   --pkg-dir=./Work
+  # --hang-detect-time=5000000 \
   # --evaluate-fifo-depth \

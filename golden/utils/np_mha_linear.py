@@ -20,7 +20,7 @@ def _choose_shift(acc_int32):
         limit <<= 1
     return shift
 
-def _quantize_gemm(x_int8_2d, W_int8_2d):
+def _quantize_gemm(x_int8_2d, W_int8_2d, relu=False):
     """
     y = x @ W with int32 accum, then >> shift and saturate to int8.
     x_int8_2d: (N, C), W_int8_2d: (C, C) -> y_int8: (N, C)
@@ -29,6 +29,8 @@ def _quantize_gemm(x_int8_2d, W_int8_2d):
     shift = _choose_shift(acc)
     y = (acc >> shift).astype(np.int32)
     y = np.clip(y, -128, 127).astype(np.int8)
+    if relu:
+        y = np.maximum(y, 0)
     return y, shift
 
 class NumpyMHALinear:
@@ -131,12 +133,12 @@ class NumpyMHALinear:
 
         # ----- Output linear (exportable) -----
         ctx2d = ctx.reshape(BT, C)  # int8
-        out_proj, sh_o = _quantize_gemm(ctx2d, self.Wo)
+        out_proj, sh_o = _quantize_gemm(ctx2d, self.Wo, relu=True)
 
         # for debug
         if layers is not None:
             layers.append({'name': f'{self.name}_Wo', 'x': ctx2d, 'k': self.Wo,
-                           'y': out_proj, 'a': out_proj, 'shift': sh_o, 'is_relu': False})
+                           'y': out_proj, 'a': out_proj, 'shift': sh_o, 'is_relu': True})
             
         print(f"SHIFT_Q = {sh_q}")
         print(f"SHIFT_K = {sh_k}")
