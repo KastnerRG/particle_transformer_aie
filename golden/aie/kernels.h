@@ -134,12 +134,32 @@ void context(
   }
 }
 
+// Concatenate two (m*Tm) x (n*Tn) int8 matrices.
+template <int m, int n, int Tm, int Tn>
+void concat(
+  input_stream_int8 * __restrict sA,
+  input_stream_int8 * __restrict sB,
+  output_stream_int8 * __restrict sC
+) {
+  using V = aie::vector<int8, m*n>;
+ 
+
+  for (int im = 0; im < Tm; ++im) {
+    for (int in = 0; in < Tn; ++in) {
+      writeincr(sC, readincr_v<m*n>(sA));
+    }
+    for (int in = 0; in < Tn; ++in) {
+      writeincr(sC, readincr_v<m*n>(sB));
+    }
+  }
+}
 
 // (context @ Wo)  (T,d_model) @ (d_model,d_model) -> (T,d_model)
-template <int m, int k, int n, int d_model, int T, int SHIFT_O>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT_O>
 void output(
-  input_stream_int8* __restrict context_in,
-  output_stream_int8* __restrict out_stream,
+  input_stream_int8* __restrict sA,
+  input_stream_int8* __restrict sB,
+  output_stream_int8* __restrict sO,
   const int8 Wo[]
 ) {
   using MMUL = aie::mmul<m, k, n, int8, int8>;
@@ -147,21 +167,21 @@ void output(
   using VB   = aie::vector<int8, MMUL::size_B>;
   using VC   = aie::vector<int8, MMUL::size_C>;
 
-  const int Tm = T / m;
-  const int Tk = d_model / k;
-  const int Tn = d_model / n;
-
   const int8* __restrict Bbase = (const int8*)Wo;
   const unsigned strideB_perK  = MMUL::size_B * Tn;
 
-  for (unsigned im = 0; im < Tm; ++im)
-  chess_prepare_for_pipelining chess_loop_range(1,) {
+  for (unsigned im = 0; im < Tm; ++im) {
+  // chess_prepare_for_pipelining chess_loop_range(1,) {
     VA Abuf[Tk];
-    for (unsigned ik = 0; ik < Tk; ++ik)
-      Abuf[ik] = readincr_v<MMUL::size_A>(context_in);
+    for (unsigned ik = 0; ik < Tk/2; ++ik) {
+      Abuf[ik] = readincr_v<MMUL::size_A>(sA);
+    }
+    for (unsigned ik = Tk/2; ik < Tk; ++ik) {
+      Abuf[ik] = readincr_v<MMUL::size_A>(sB);
+    }
 
-    for (unsigned in = 0; in < Tn; ++in)
-    chess_prepare_for_pipelining chess_loop_range(1,) {
+    for (unsigned in = 0; in < Tn; ++in) {
+    // chess_prepare_for_pipelining chess_loop_range(1,) {
       MMUL C;
       const int8* __restrict pB = Bbase + in * MMUL::size_B;
 
@@ -172,7 +192,8 @@ void output(
       }
 
       VC v = C.template to_vector<int8>(SHIFT_O);
-      writeincr(out_stream, v);
+      v = aie::max(v, (int8)0);
+      writeincr(sO, v);
     }
   }
 }

@@ -182,16 +182,33 @@ void scores{idx}_head{h}(input_stream_int8 * __restrict q_head, input_stream_int
 void context{idx}_head{h}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ context<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}>(x, v, a);}}
 ''')
 
-    # Output projection (after concatenating all heads): (160, d_model) @ (d_model, d_model) -> (160, d_model)
+    # (h0+h1)->concat_0, (h2+h3)->concat_1, then output kernel does final concat
+    with open(f"aie/layer_{idx}_concat.cc", "w") as f:
+        f.write(f'''#include "kernels.h"
+
+// Concat head 0 and head 1: (160,16) + (160,16) -> (160,32)
+void concat{idx}_0(input_stream_int8 * __restrict sA, input_stream_int8 * __restrict sB, output_stream_int8 * __restrict sC){{
+  concat<{m}, {n}, {T//m}, {head_dim//n}>(sA, sB, sC);
+}}
+
+// Concat head 2 and head 3: (160,16) + (160,16) -> (160,32)
+void concat{idx}_1(input_stream_int8 * __restrict sA, input_stream_int8 * __restrict sB, output_stream_int8 * __restrict sC){{
+  concat<{m}, {n}, {T//m}, {head_dim//n}>(sA, sB, sC);
+}}
+''')
+
+    # Output projection: uses output() kernel which concatenates 2 inputs (concat_0 + concat_1) + matmul
+    # (160,32) + (160,32) -> (160,64) @ (64,64) -> (160,64)
     with open(f"aie/layer_{idx}_out.cc", "w") as f:
         f.write(f'''#include <cstdint>
 __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wo_tiled.size}] = {{ {", ".join(str(int(x)) for x in Wo_tiled)} }};
 
 #include "kernels.h"
 
-void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {d_model//n}, {SHIFT_O}, true>(x, a, k_p);}}
+void out{idx}(input_stream_int8 * __restrict sA, input_stream_int8 * __restrict sB, output_stream_int8 * __restrict a){{output<{m}, {k}, {n}, {T//m}, {d_model//k}, {d_model//n}, {SHIFT_O}>(sA, sB, a, k_p);}}
 ''')
-    
+
+
 
     in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
 
@@ -241,15 +258,32 @@ void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict 
             f.write(f"fifo_depth(s{h}_sv) = {int(T*T/4)};\n")
             f.write(f"connect<stream>(mha[{v_idx}].out[0], mha[{context_idx}].in[1]);\n\n")
 
-        # Output projection kernel (after concatenating all heads)
-        out_idx = num_heads * 5
+        # concat_0_idx: concatenates head 0 and head 1
+        # concat_1_idx: concatenates head 2 and head 3
+        concat_0_idx = num_heads * 5  # 20
+        concat_1_idx = num_heads * 5 + 1  # 21
+        out_idx = num_heads * 5 + 2  # 22
+
+        # Create concat_0 kernel: head0 + head1 -> (160,32)
+        f.write(f"mha[{concat_0_idx}] = kernel::create(concat{idx}_0);\n")
+        f.write(f'source(mha[{concat_0_idx}]) = "layer_{idx}_concat.cc";\n')
+        f.write(f'runtime<ratio>(mha[{concat_0_idx}]) = 1.0;\n')
+        f.write(f"connect<stream>(mha[{4}].out[0], mha[{concat_0_idx}].in[0]);\n")  # head 0 context
+        f.write(f"connect<stream>(mha[{9}].out[0], mha[{concat_0_idx}].in[1]);\n\n")  # head 1 context
+
+        # Create concat_1 kernel: head2 + head3 -> (160,32)
+        f.write(f"mha[{concat_1_idx}] = kernel::create(concat{idx}_1);\n")
+        f.write(f'source(mha[{concat_1_idx}]) = "layer_{idx}_concat.cc";\n')
+        f.write(f'runtime<ratio>(mha[{concat_1_idx}]) = 1.0;\n')
+        f.write(f"connect<stream>(mha[{14}].out[0], mha[{concat_1_idx}].in[0]);\n")  # head 2 context
+        f.write(f"connect<stream>(mha[{19}].out[0], mha[{concat_1_idx}].in[1]);\n\n")  # head 3 context
+
+        # Create output projection kernel: concat_0 + concat_1 -> (160,64) via output() kernel
         f.write(f"mha[{out_idx}] = kernel::create(out{idx});\n")
         f.write(f'source(mha[{out_idx}]) = "layer_{idx}_out.cc";\n')
         f.write(f'runtime<ratio>(mha[{out_idx}]) = 1.0;\n')
-
-        # Connect all context outputs to output projection
-        # For now, just connect head 0's context output (TODO: need to concatenate all heads)
-        f.write(f"connect<stream>(mha[{4}].out[0], mha[{out_idx}].in[0]);\n\n")
+        f.write(f"connect<stream>(mha[{concat_0_idx}].out[0], mha[{out_idx}].in[0]);\n")
+        f.write(f"connect<stream>(mha[{concat_1_idx}].out[0], mha[{out_idx}].in[1]);\n\n")
 
 def to_btc(t):
     if t.ndim == 2:  # (T,C)
@@ -285,7 +319,7 @@ if __name__ == "__main__":
 
     
     # ---- MHA 1 + residual ----
-    numheads = 1 #4
+    numheads = 4
     Wq = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
     Wk = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
     Wv = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
@@ -380,9 +414,14 @@ if __name__ == "__main__":
             f.write(f'void scores{1}_head{h}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
             f.write(f'void context{1}_head{h}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
             f.write(f'\n')
+        if numheads == 4:
+            f.write(f'void concat{1}_0(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+            f.write(f'void concat{1}_1(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n\n')
 
-        # Output projection function
-        f.write(f'void out{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+        if numheads == 1:
+            f.write(f'void out{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+        else:
+            f.write(f'void out{1}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
 
     # 2. Process each layer: write weights.h, x.txt, a.txt, layer_graph.h
 
@@ -393,10 +432,12 @@ if __name__ == "__main__":
     np.savetxt("data/out_ref.txt", np.tile(tiled_mat, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
 
     # 3. Postamble of layer_graph.h - connect last layer to AIE_OUT
-    
+
     out_bytes = layers[-1]['a'].size * layers[-1]['a'].itemsize
+    # For num_heads=4: out_idx = 4*5 + 2 = 22 (5 kernels/head + 2 concat + 1 output)
+    final_out_idx = numheads * 5 + 2
     with open("aie/layer_graph.h", "a") as f:
-        f.write(f"connect<stream>(mha[{5}].out[0], AIE_OUT.in[0]);\n")    
+        f.write(f"connect<stream>(mha[{final_out_idx}].out[0], AIE_OUT.in[0]);\n")    
 
     # 4. Run AIE (graph.cpp)
 
