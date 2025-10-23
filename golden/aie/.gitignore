@@ -1,3 +1,6 @@
+
+layer*
+
 # Ignore build output directory
 /build
 /export
@@ -5,6 +8,7 @@
 # Ignore object files and dependent files
 .o
 .d
+*.swp
 
 #Ignore logs folder and log files
 /logs

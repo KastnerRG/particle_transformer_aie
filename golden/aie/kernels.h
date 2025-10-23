@@ -50,7 +50,7 @@ void dense(
 // (Q @ K^T):  (T, d_model) @ (T, d_model)^T -> (T, T)
 // m=4, k=8, n=8, T=160, d_model=64, Tm(rows)=160/m=40, Tn(columns)=64/n=8
 template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int SHIFT_S>
-void attention(
+void scores(
   input_stream_int8 * __restrict sQ, // adf::input_buffer<int8, adf::extents<T*d_model>> & sQ,
   input_stream_int8 * __restrict sK, // adf::input_buffer<int8, adf::extents<T*d_model>> & sK,
   output_stream_int8 * __restrict sS
@@ -90,7 +90,7 @@ void attention(
 // Tm = 160/4 = 40, Tk = 160/4 = 20, Tn = 64/8 = 8
 // 160 x 160 x 64 tiled with 4 x 4 x 8
 template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT>
-void head(
+void context(
   input_stream_int8 * __restrict sS,
   input_stream_int8 * __restrict sV,
   output_stream_int8 * __restrict sC

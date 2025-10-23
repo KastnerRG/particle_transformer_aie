@@ -80,30 +80,11 @@ def golden_fc(x, k, is_relu, shift):
     layer_fc =  [{'x': x, 'k': k, 'y': y, 'a': a, 'shift': shift, 'is_relu': is_relu}]
     return a, layer_fc 
 
-def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iterations):
-     # Generate weights & intermediate input/output matrices
-    Wq_tiled   = tile_matrix(layer_q["k"], k, n)
-    Wk_tiled   = tile_matrix(layer_k["k"], k, n)
-    Wv_tiled   = tile_matrix(layer_v["k"], k, n)
-    Wo_tiled   = tile_matrix(layer_o["k"], k, n)
-    out_x_tiled = tile_matrix(layer_o["x"], m, k)
-
-    np.savetxt(f"data/mha_Wq{idx}.txt", layer_q["k"], fmt="%d")
-    np.savetxt(f"data/mha_Wk{idx}.txt", layer_k["k"], fmt="%d")
-    np.savetxt(f"data/mha_Wv{idx}.txt", layer_v["k"], fmt="%d")
-    np.savetxt(f"data/mha_Wo{idx}.txt", layer_o["k"], fmt="%d")
-    np.savetxt(f"data/out_x{idx}.txt", np.tile(out_x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
-
-
-    x_tiled = tile_matrix(layer_q["x"], m, k)
-    # a_tiled = tile_matrix(layer_o["a"], m, n)
-    np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
-    # np.savetxt(f"data/a{idx}.txt", np.tile(a_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
-
+def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iterations, num_heads):
+    # Extract parameters
     m = 4
     k = 8
     n = 8
-    num_heads = 1
     d_model = 64
     T = 160 # first dimension of input to mha
     SHIFT_Q = 10
@@ -115,55 +96,95 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
 
     head_dim = d_model // num_heads
 
-    # Q (160,64)@(64,64) TODO: repeat for each head
-    with open(f"aie/layer_{idx}_q.cc", "a") as f:
-        f.write(f'''
-#include <cstdint>
-__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wq_tiled.size}] = {{ {", ".join(str(int(x)) for x in Wq_tiled)} }};
+    # Split weight matrices by head: (64,64) -> num_heads x (64,16)
+    # Each head gets columns [h*head_dim : (h+1)*head_dim]
+    Wq_heads = []
+    Wk_heads = []
+    Wv_heads = []
+
+    for h in range(num_heads):
+        col_start = h * head_dim
+        col_end = (h + 1) * head_dim
+
+        # Extract per-head weight slices: (64, head_dim)
+        Wq_h = layer_q["k"][:, col_start:col_end]  # (64, 16) for 4 heads
+        Wk_h = layer_k["k"][:, col_start:col_end]
+        Wv_h = layer_v["k"][:, col_start:col_end]
+
+        # Tile each head's weight matrix
+        Wq_h_tiled = tile_matrix(Wq_h, k, n)
+        Wk_h_tiled = tile_matrix(Wk_h, k, n)
+        Wv_h_tiled = tile_matrix(Wv_h, k, n)
+
+        Wq_heads.append(Wq_h_tiled)
+        Wk_heads.append(Wk_h_tiled)
+        Wv_heads.append(Wv_h_tiled)
+
+        # Save per-head weights to separate files
+        np.savetxt(f"data/mha_Wq{idx}_head{h}.txt", Wq_h, fmt="%d")
+        np.savetxt(f"data/mha_Wk{idx}_head{h}.txt", Wk_h, fmt="%d")
+        np.savetxt(f"data/mha_Wv{idx}_head{h}.txt", Wv_h, fmt="%d")
+
+    # Output projection is still full width: (64,64)
+    Wo_tiled = tile_matrix(layer_o["k"], k, n)
+    np.savetxt(f"data/mha_Wo{idx}.txt", layer_o["k"], fmt="%d")
+
+    # Input and output data
+    x_tiled = tile_matrix(layer_q["x"], m, k)
+    out_x_tiled = tile_matrix(layer_o["x"], m, k)
+
+    np.savetxt(f"data/x{idx}.txt", np.tile(x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
+    np.savetxt(f"data/out_x{idx}.txt", np.tile(out_x_tiled, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
+
+    # Generate Q, K, V projection kernels for each head
+    for h in range(num_heads):
+        # Q projection: (160,64) @ (64, head_dim) -> (160, head_dim)
+        with open(f"aie/layer_{idx}_q_head{h}.cc", "w") as f:
+            f.write(f'''#include <cstdint>
+__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wq_heads[h].size}] = {{ {", ".join(str(int(x)) for x in Wq_heads[h])} }};
 
 #include "kernels.h"
 
-void q{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_Q}, false>(x, a, k_p);}}
+void q{idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_Q}, false>(x, a, k_p);}}
 ''')
-    # K (160,64)@(64,64) TODO: repeat for each head
-    with open(f"aie/layer_{idx}_k.cc", "a") as f:
-        f.write(f'''
-#include <cstdint>
-__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wk_tiled.size}] = {{ {", ".join(str(int(x)) for x in Wk_tiled)} }};
+
+        # K projection: (160,64) @ (64, head_dim) -> (160, head_dim)
+        with open(f"aie/layer_{idx}_k_head{h}.cc", "w") as f:
+            f.write(f'''#include <cstdint>
+__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wk_heads[h].size}] = {{ {", ".join(str(int(x)) for x in Wk_heads[h])} }};
 
 #include "kernels.h"
 
-void k{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_K}, false>(x, a, k_p);}}
+void k{idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_K}, false>(x, a, k_p);}}
 ''')
-    # V (160,64)@(64,64) TODO: repeat for each head
-    with open(f"aie/layer_{idx}_v.cc", "a") as f:
-        f.write(f'''
-#include <cstdint>
-__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wv_tiled.size}] = {{ {", ".join(str(int(x)) for x in Wv_tiled)} }};
+
+        # V projection: (160,64) @ (64, head_dim) -> (160, head_dim)
+        with open(f"aie/layer_{idx}_v_head{h}.cc", "w") as f:
+            f.write(f'''#include <cstdint>
+__attribute__((section(".data"))) alignas(32) int8_t k_p [{Wv_heads[h].size}] = {{ {", ".join(str(int(x)) for x in Wv_heads[h])} }};
 
 #include "kernels.h"
 
-void v{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_V}, false>(x, a, k_p);}}
+void v{idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ dense<{m}, {k}, {n}, {T//m}, {d_model//k}, {head_dim//n}, {SHIFT_V}, false>(x, a, k_p);}}
 ''')
-    # score = (Q @ K^T)  (160,64)@(64,160)  TODO: repeat for each head
-    with open(f"aie/layer_{idx}_attn.cc", "a") as f:
-        f.write(f'''
-#include "kernels.h"
 
-void attn{idx}(input_stream_int8 * __restrict q_head, input_stream_int8 * __restrict k_head, output_stream_int8 * __restrict o_head){{ attention<{m}, {k}, {n}, {T//m}, {d_model//k}, {d_model//n}, {d_model}, {T}, {SHIFT_S}>(q_head, k_head, o_head);}}
-''')
-    # head = (scores @ V) (160,160)@(160,64) TODO: repeat for each head
-    with open(f"aie/layer_{idx}_head.cc", "a") as f:
-        f.write(f'''
-#include "kernels.h"
+        # Scores: Q @ K^T for this head (160, head_dim) @ (head_dim, 160) -> (160, 160)
+        with open(f"aie/layer_{idx}_scores_head{h}.cc", "w") as f:
+            f.write(f'''#include "kernels.h"
 
-void head{idx}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ head<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}>(x, v, a);}}
+void scores{idx}_head{h}(input_stream_int8 * __restrict q_head, input_stream_int8 * __restrict k_head, output_stream_int8 * __restrict o_head){{ scores<{m}, {k}, {n}, {T//m}, {head_dim//k}, {head_dim//n}, {head_dim}, {T}, {SHIFT_S}>(q_head, k_head, o_head);}}
 ''')
-    head_idx = 0
-    # (concatenated heads @ Wo) (160,64)@(64,64)
-    with open(f"aie/layer_{idx}_out.cc", "a") as f:
-        f.write(f'''
-#include <cstdint>
+
+        # Context: (scores @ V) for this head (160, 160) @ (160, head_dim) -> (160, head_dim)
+        with open(f"aie/layer_{idx}_context_head{h}.cc", "w") as f:
+            f.write(f'''#include "kernels.h"
+
+void context{idx}_head{h}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ context<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}>(x, v, a);}}
+''')
+
+    # Output projection (after concatenating all heads): (160, d_model) @ (d_model, d_model) -> (160, d_model)
+    with open(f"aie/layer_{idx}_out.cc", "w") as f:
+        f.write(f'''#include <cstdint>
 __attribute__((section(".data"))) alignas(32) int8_t k_p [{Wo_tiled.size}] = {{ {", ".join(str(int(x)) for x in Wo_tiled)} }};
 
 #include "kernels.h"
@@ -174,41 +195,61 @@ void out{idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict 
 
     in_port = "AIE_IN" if idx == 0 else f"layers[{idx-1}]"
 
-    with open("aie/layer_graph.h", "a") as f: # TODO: set mha index properly
-        f.write(f"mha[{0}] = kernel::create(q{idx});\n")
-        f.write(f'source(mha[{0}]) = "layer_{idx}_q.cc";\n')
-        f.write(f'runtime<ratio>(mha[{0}]) = 1.0;\n')
-        f.write(f"connect<stream>({in_port}.out[0], mha[{0}].in[0]);\n\n")
+    with open("aie/layer_graph.h", "a") as f:
+        # Generate graph connections for each head
+        for h in range(num_heads):
+            base = h * 5  # Each head has 5 kernels: q, k, v, scores, context
 
-        f.write(f"mha[{1}] = kernel::create(k{idx});\n")
-        f.write(f'source(mha[{1}]) = "layer_{idx}_k.cc";\n')
-        f.write(f'runtime<ratio>(mha[{1}]) = 1.0;\n')
-        f.write(f"connect<stream>({in_port}.out[0], mha[{1}].in[0]);\n\n")
+            # Kernel indices within this head
+            q_idx = base + 0
+            k_idx = base + 1
+            v_idx = base + 2
+            scores_idx = base + 3
+            context_idx = base + 4
 
-        f.write(f"mha[{2}] = kernel::create(v{idx});\n")
-        f.write(f'source(mha[{2}]) = "layer_{idx}_v.cc";\n')
-        f.write(f'runtime<ratio>(mha[{2}]) = 1.0;\n')
-        f.write(f"connect<stream>({in_port}.out[0], mha[{2}].in[0]);\n\n")
+            # Q projection kernel
+            f.write(f"mha[{q_idx}] = kernel::create(q{idx}_head{h});\n")
+            f.write(f'source(mha[{q_idx}]) = "layer_{idx}_q_head{h}.cc";\n')
+            f.write(f'runtime<ratio>(mha[{q_idx}]) = 1.0;\n')
+            f.write(f"connect<stream>({in_port}.out[0], mha[{q_idx}].in[0]);\n\n")
 
-        f.write(f"mha[{3}] = kernel::create(attn{idx});\n")
-        f.write(f'source(mha[{3}]) = "layer_{idx}_attn.cc";\n')
-        f.write(f'runtime<ratio>(mha[{3}]) = 1.0;\n')
-        f.write(f"connect<stream> s1(mha[{0}].out[0], mha[{3}].in[0]);\n")
-        f.write(f"fifo_depth(s1) = {int(T*d_model/4)};\n") # stream is 32 bit wide, so 4 int8s fit
-        f.write(f"connect<stream>(mha[{1}].out[0], mha[{3}].in[1]);\n\n")
+            # K projection kernel
+            f.write(f"mha[{k_idx}] = kernel::create(k{idx}_head{h});\n")
+            f.write(f'source(mha[{k_idx}]) = "layer_{idx}_k_head{h}.cc";\n')
+            f.write(f'runtime<ratio>(mha[{k_idx}]) = 1.0;\n')
+            f.write(f"connect<stream>({in_port}.out[0], mha[{k_idx}].in[0]);\n\n")
 
-        f.write(f"mha[{4}] = kernel::create(head{idx});\n")
-        f.write(f'source(mha[{4}]) = "layer_{idx}_head.cc";\n')
-        f.write(f'runtime<ratio>(mha[{4}]) = 1.0;\n')
-        f.write(f"connect<stream> s2(mha[{3}].out[0], mha[{4}].in[0]);\n") #sS
-        f.write(f"fifo_depth(s2) = {int(T*d_model/4)};\n")
-        f.write(f"connect<stream>(mha[{2}].out[0], mha[{4}].in[1]);\n\n") #sV
+            # V projection kernel
+            f.write(f"mha[{v_idx}] = kernel::create(v{idx}_head{h});\n")
+            f.write(f'source(mha[{v_idx}]) = "layer_{idx}_v_head{h}.cc";\n')
+            f.write(f'runtime<ratio>(mha[{v_idx}]) = 1.0;\n')
+            f.write(f"connect<stream>({in_port}.out[0], mha[{v_idx}].in[0]);\n\n")
 
+            # Scores kernel (Q @ K^T)
+            f.write(f"mha[{scores_idx}] = kernel::create(scores{idx}_head{h});\n")
+            f.write(f'source(mha[{scores_idx}]) = "layer_{idx}_scores_head{h}.cc";\n')
+            f.write(f'runtime<ratio>(mha[{scores_idx}]) = 1.0;\n')
+            f.write(f"connect<stream> s{h}_qk(mha[{q_idx}].out[0], mha[{scores_idx}].in[0]);\n")
+            f.write(f"fifo_depth(s{h}_qk) = {int(T*head_dim/4)};\n")
+            f.write(f"connect<stream>(mha[{k_idx}].out[0], mha[{scores_idx}].in[1]);\n\n")
 
-        f.write(f"mha[{5}] = kernel::create(out{idx});\n")
-        f.write(f'source(mha[{5}]) = "layer_{idx}_out.cc";\n')
-        f.write(f'runtime<ratio>(mha[{5}]) = 1.0;\n')
-        f.write(f"connect<stream>(mha[{4}].out[0], mha[{5}].in[0]);\n\n")
+            # Context kernel (scores @ V)
+            f.write(f"mha[{context_idx}] = kernel::create(context{idx}_head{h});\n")
+            f.write(f'source(mha[{context_idx}]) = "layer_{idx}_context_head{h}.cc";\n')
+            f.write(f'runtime<ratio>(mha[{context_idx}]) = 1.0;\n')
+            f.write(f"connect<stream> s{h}_sv(mha[{scores_idx}].out[0], mha[{context_idx}].in[0]);\n")
+            f.write(f"fifo_depth(s{h}_sv) = {int(T*T/4)};\n")
+            f.write(f"connect<stream>(mha[{v_idx}].out[0], mha[{context_idx}].in[1]);\n\n")
+
+        # Output projection kernel (after concatenating all heads)
+        out_idx = num_heads * 5
+        f.write(f"mha[{out_idx}] = kernel::create(out{idx});\n")
+        f.write(f'source(mha[{out_idx}]) = "layer_{idx}_out.cc";\n')
+        f.write(f'runtime<ratio>(mha[{out_idx}]) = 1.0;\n')
+
+        # Connect all context outputs to output projection
+        # For now, just connect head 0's context output (TODO: need to concatenate all heads)
+        f.write(f"connect<stream>(mha[{4}].out[0], mha[{out_idx}].in[0]);\n\n")
 
 def to_btc(t):
     if t.ndim == 2:  # (T,C)
@@ -306,8 +347,8 @@ if __name__ == "__main__":
 
     for path in [
         "data", "aie/layer_graph.h", "aie/include.h", "aie/model.cc", "aie/model.h",
-        "aie/weights.h", "aie/layer_0.cc",  "aie/layer_1_attn.cc", "aie/layer_1_head.cc", "aie/layer_1_k.cc", "aie/layer_1_out.cc", "aie/layer_1_q.cc", "aie/layer_1_v.cc", 
-        "*.log", "aiesimulator_output", "Work", ".Xil", 
+        "aie/weights.h", "aie/layer_0.cc", "aie/layer_1_*.cc",
+        "*.log", "aiesimulator_output", "Work", ".Xil",
         ".AIE_SIM_CMD_LINE_OPTIONS", "ISS_RPC_SERVER_PORT",
         "libadf.a", "Map_Report.csv", "pl_sample_counts",
         "plio_throughput_info.json", "sol.db", "aiesim.vcd"
@@ -323,22 +364,30 @@ if __name__ == "__main__":
 
     print_layers_brief(layers)
 
-    # 1. include.h - common parameters
-    
+    # 1. include.h - common parameters and function declarations
+
     with open("aie/include.h", "w") as f:
-        f.write(f'#define N_LAYERS {1}\n#define ITERATIONS {iterations}\n')
-        f.write(f'void f{0}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
-        f.write(f'void q{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
-        f.write(f'void k{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
-        f.write(f'void v{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
-        f.write(f'void attn{1}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
-        f.write(f'void head{1}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+        f.write(f'#define N_LAYERS {1}\n#define ITERATIONS {iterations}\n\n')
+
+        # Dense layer function
+        f.write(f'void f{0}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n\n')
+
+        # MHA per-head functions
+        for h in range(numheads):
+            f.write(f'void q{1}_head{h}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+            f.write(f'void k{1}_head{h}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+            f.write(f'void v{1}_head{h}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+            f.write(f'void scores{1}_head{h}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+            f.write(f'void context{1}_head{h}(input_stream_int8 * __restrict, input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+            f.write(f'\n')
+
+        # Output projection function
         f.write(f'void out{1}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
 
     # 2. Process each layer: write weights.h, x.txt, a.txt, layer_graph.h
 
     process_dense_layer(0, layers[0], m, k, n, iterations)
-    process_mha_layer(1, m, k, n, layers[1], layers[2], layers[3], layers[4], iterations)
+    process_mha_layer(1, m, k, n, layers[1], layers[2], layers[3], layers[4], iterations, numheads)
     
     tiled_mat = tile_matrix(layers[-1]['a'], m, n)
     np.savetxt("data/out_ref.txt", np.tile(tiled_mat, (iterations, 1)).reshape(-1, 16), fmt="%s", delimiter=" ")
