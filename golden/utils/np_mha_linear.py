@@ -52,8 +52,8 @@ class NumpyMHALinear:
         rng = np.random.default_rng(seed)
         
         def initW():
-            return rng.integers(-128, 128, size=(d_model, d_model), dtype=np.int8)
             print("making a weight")
+            return rng.integers(-128, 128, size=(d_model, d_model), dtype=np.int8)
 
         self.Wq = Wq if Wq is not None else initW()
         self.Wk = Wk if Wk is not None else initW()
@@ -104,6 +104,8 @@ class NumpyMHALinear:
 
         # ----- Linear attention core (NO softmax; nonlinear parts commented) -----
         ctx_h = np.empty_like(vh)  # (B,H,T,dh), int8
+        sh_s_heads = np.empty(self.H, dtype=int)
+        sh_c_heads = np.empty(self.H, dtype=int)
 
         for b in range(B):
             for h in range(self.H):
@@ -118,12 +120,14 @@ class NumpyMHALinear:
                 # # if training and dropout>0: apply dropout mask
                 # Quantize scores to int8
                 sh_s = _choose_shift(scores_acc)
+                sh_s_heads[h] = sh_s
                 scores_q = np.clip(scores_acc >> sh_s, -128, 127).astype(np.int8)  # (T,T)
 
                 V = vh[b, h].astype(np.int32)               # (T,dh), promote for accum
                 ctx_acc = scores_q.astype(np.int32) @ V     # (T,dh) int32
 
                 sh_c = _choose_shift(ctx_acc)
+                sh_c_heads[h] = sh_c
                 ctx_q = np.clip(ctx_acc >> sh_c, -128, 127).astype(np.int8)  # (T,dh)
 
                 ctx_h[b, h] = ctx_q
@@ -143,8 +147,8 @@ class NumpyMHALinear:
         print(f"SHIFT_Q = {sh_q}")
         print(f"SHIFT_K = {sh_k}")
         print(f"SHIFT_V = {sh_v}")
-        print(f"SHIFT_S = {sh_s}")
-        print(f"SHIFT_C = {sh_c}")
+        print(f"SHIFT_S (per head) = {sh_s_heads}")
+        print(f"SHIFT_C (per head) = {sh_c_heads}")
         print(f"SHIFT_O = {sh_o}")
 
         out = out_proj.reshape(B, T, C)  # int8

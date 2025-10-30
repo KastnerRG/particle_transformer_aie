@@ -90,9 +90,11 @@ def process_mha_layer(idx, m, k, n, layer_q, layer_k, layer_v, layer_o, iteratio
     SHIFT_Q = 10
     SHIFT_K = 11
     SHIFT_V = 11
-    SHIFT_S = 8
-    SHIFT_C = 10
-    SHIFT_O = 10 # layer_o["shift"]
+    # SHIFT_S = 8
+    # SHIFT_C = 10
+    SHIFT_S = [6, 6, 7, 7]  # per-head
+    SHIFT_C = [10, 10, 10, 10]
+    SHIFT_O = 9
 
     head_dim = d_model // num_heads
 
@@ -172,14 +174,14 @@ void v{idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __res
         with open(f"aie/layer_{idx}_scores_head{h}.cc", "w") as f:
             f.write(f'''#include "kernels.h"
 
-void scores{idx}_head{h}(input_stream_int8 * __restrict q_head, input_stream_int8 * __restrict k_head, output_stream_int8 * __restrict o_head){{ scores<{m}, {k}, {n}, {T//m}, {head_dim//k}, {head_dim//n}, {head_dim}, {T}, {SHIFT_S}>(q_head, k_head, o_head);}}
+void scores{idx}_head{h}(input_stream_int8 * __restrict q_head, input_stream_int8 * __restrict k_head, output_stream_int8 * __restrict o_head){{ scores<{m}, {k}, {n}, {T//m}, {head_dim//k}, {head_dim//n}, {head_dim}, {T}, {SHIFT_S[h]}>(q_head, k_head, o_head);}}
 ''')
 
         # Context: (scores @ V) for this head (160, 160) @ (160, head_dim) -> (160, head_dim)
         with open(f"aie/layer_{idx}_context_head{h}.cc", "w") as f:
             f.write(f'''#include "kernels.h"
 
-void context{idx}_head{h}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ context<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C}>(x, v, a);}}
+void context{idx}_head{h}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ context<{m}, {k}, {n}, {T//m}, {T//k}, {head_dim//n}, {SHIFT_C[h]}>(x, v, a);}}
 ''')
 
     # (h0+h1)->concat_0, (h2+h3)->concat_1, then output kernel does final concat

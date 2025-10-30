@@ -87,7 +87,7 @@ void scores(
 }
 
 // (scores @ V)  (T,T) @ (T,d_model) -> (T,d_model) mxk
-// Tm = 160/4 = 40, Tk = 160/4 = 20, Tn = 64/8 = 8
+// Tm = 160/4 = 40, Tk = 160/4 = 40, Tn = 64/8 = 8
 // 160 x 160 x 64 tiled with 4 x 4 x 8
 template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT>
 void context(
@@ -96,12 +96,12 @@ void context(
   output_stream_int8 * __restrict sC
 ) {
   using MMUL = aie::mmul<m, m, n, int8, int16>; // 4x4x8 -> 4x8
-  using VA   = aie::vector<int8,  MMUL::size_A>; // mxm (int8)
-  using VB   = aie::vector<int16, MMUL::size_B>; // mxn (int16)
-  using VC   = aie::vector<int16, MMUL::size_C>; // mxn (int16)
+  using VA   = aie::vector<int8,  MMUL::size_A>; // 4x4 (int8)
+  using VB   = aie::vector<int16, MMUL::size_B>; // 4x8 (int16)
+  using VC   = aie::vector<int16, MMUL::size_C>; // 4x8 (int16)
 
   using VBin = aie::vector<int8, MMUL::size_B>; // 4x8 (int8)
-  using VCout = aie::vector<int8, MMUL::size_C>;
+  using VCout = aie::vector<int8, MMUL::size_C>; // 4x8 (int8)
 
   VB matB[Tm*Tn];
 
