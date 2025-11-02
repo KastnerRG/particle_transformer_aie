@@ -91,8 +91,10 @@ class NumpyMHALinear:
         v_proj, sh_v = _quantize_gemm(v2d, self.Wv)
 
         if layers is not None:
+            # Store Q layer with shift_scores and shift_context for later retrieval
             layers.append({'name': f'{self.name}_Wq', 'x': q2d, 'k': self.Wq,
-                           'y': q_proj, 'a': q_proj, 'shift': sh_q, 'is_relu': False})
+                           'y': q_proj, 'a': q_proj, 'shift': sh_q, 'is_relu': False,
+                           'shift_scores': None, 'shift_context': None})  # Will be filled after attention
             layers.append({'name': f'{self.name}_Wk', 'x': k2d, 'k': self.Wk,
                            'y': k_proj, 'a': k_proj, 'shift': sh_k, 'is_relu': False})
             layers.append({'name': f'{self.name}_Wv', 'x': v2d, 'k': self.Wv,
@@ -143,7 +145,13 @@ class NumpyMHALinear:
         if layers is not None:
             layers.append({'name': f'{self.name}_Wo', 'x': ctx2d, 'k': self.Wo,
                            'y': out_proj, 'a': out_proj, 'shift': sh_o, 'is_relu': True})
-            
+
+            # Update the Wq layer with the computed shift values for scores and context
+            # Find the Wq layer (it's 4 layers back from the current position)
+            wq_idx = len(layers) - 4
+            layers[wq_idx]['shift_scores'] = sh_s_heads.tolist()
+            layers[wq_idx]['shift_context'] = sh_c_heads.tolist()
+
         print(f"SHIFT_Q = {sh_q}")
         print(f"SHIFT_K = {sh_k}")
         print(f"SHIFT_V = {sh_v}")

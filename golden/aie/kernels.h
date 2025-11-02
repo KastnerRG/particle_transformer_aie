@@ -154,6 +154,28 @@ void concat(
   }
 }
 
+// Add two (m*Tm) x (n*Tn) int8 matrices element-wise with saturation.
+template <int m, int n, int Tm, int Tn>
+void resadd(
+  input_stream_int8 * __restrict sA,
+  input_stream_int8 * __restrict sB,
+  output_stream_int8 * __restrict sC
+) {
+  using V = aie::vector<int8, m*n>;
+
+  // Explicitly set saturation mode
+  aie::set_saturation(aie::saturation_mode::saturate);
+
+  for (int im = 0; im < Tm; ++im) {
+    for (int in = 0; in < Tn; ++in) {
+      V vA = readincr_v<m*n>(sA);
+      V vB = readincr_v<m*n>(sB);
+      V vC = aie::saturating_add(vA, vB);  // saturating addition
+      writeincr(sC, vC);
+    }
+  }
+}
+
 // (context @ Wo)  (T,d_model) @ (d_model,d_model) -> (T,d_model)
 template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT_O>
 void output(
