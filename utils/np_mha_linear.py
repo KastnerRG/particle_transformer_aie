@@ -1,12 +1,6 @@
 # np_mha_linear.py
 import numpy as np
 
-def residual_add_int8(x_int8, skip_int8):
-    """Keras Add()([x, skip]) with int8 saturation."""
-    y = x_int8.astype(np.int16) + skip_int8.astype(np.int16)
-    y = np.clip(y, -128, 127).astype(np.int8)
-    return y
-
 def _choose_shift(acc_int32):
     max_abs = int(np.max(np.abs(acc_int32))) if acc_int32.size else 0
     if max_abs <= 127: 
@@ -42,23 +36,18 @@ class NumpyMHALinear:
       where x/k/y/a are all int8. (No nonlinear ops are recorded.)
     - Set `name_prefix` to get entries like mha1_Wq, mha1_Wk, ...
     """
-    def __init__(self, d_model, num_heads=4, name_prefix="mha1", seed=0,
-                 Wq=None, Wk=None, Wv=None, Wo=None):
+    def __init__(self, d_model, num_heads, name_prefix, Wq, Wk, Wv, Wo):
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
         self.C = d_model
         self.H = num_heads
         self.dh = d_model // num_heads
         self.name = str(name_prefix)
-        rng = np.random.default_rng(seed)
         
-        def initW():
-            print("making a weight")
-            return rng.integers(-128, 128, size=(d_model, d_model), dtype=np.int8)
-
-        self.Wq = Wq if Wq is not None else initW()
-        self.Wk = Wk if Wk is not None else initW()
-        self.Wv = V if (V:=Wv) is not None else initW()  # small trick to keep name short
-        self.Wo = Wo if Wo is not None else initW()
+        # All weight matrices are now required parameters
+        self.Wq = Wq
+        self.Wk = Wk
+        self.Wv = Wv
+        self.Wo = Wo
 
     def __call__(self, q, k=None, v=None, layers=None, training=False):
         # Normalize to (B,T,C)
