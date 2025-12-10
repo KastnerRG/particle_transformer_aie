@@ -215,7 +215,7 @@ class MHALayer(AIELayer):
                 fo.write(' };\n\n')
                 fo.write('#include "kernels.h"\n\n')
                 fo.write(f'void out{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-                fo.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_o}, false>')
+                fo.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_o}, true>')
                 fo.write('(x, a, k_p);}\n')
 
         self._generate_include_code()
