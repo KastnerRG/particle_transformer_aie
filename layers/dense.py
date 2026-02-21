@@ -11,6 +11,7 @@ class DenseLayer(AIELayer):
         name: str,
         weight: np.ndarray,
         shift: int,
+        bias: Optional[np.ndarray] = None,
         relu: bool = False
     ):
         """
@@ -20,17 +21,20 @@ class DenseLayer(AIELayer):
             name: Layer name
             weight: Weight matrix (int8), shape (in_features, out_features)
             shift: Right shift for requantization
+            bias: Optional bias vector (int8), shape (out_features,)
             relu: Apply ReLU activation
 
         Note: Tiling parameters (m, k, n) are set by AIEModel when layer is added.
         """
         super().__init__(name, 'dense', params={
             'weight': weight,
+            'bias': bias,
             'shift': shift,
             'relu': relu
         })
 
         self.weight = weight
+        self.bias = bias
         self.shift = shift
         self.relu = relu
 
@@ -56,8 +60,12 @@ class DenseLayer(AIELayer):
             f"Batch dimension {x.shape[0]} must be divisible by m={self.m}"
 
         y = np.matmul(x.astype(np.int32), self.weight.astype(np.int32))
-
-        y = (y >> self.shift).astype(np.int8)
+        y = (y >> self.shift).astype(np.int32)
+        if self.bias is not None:
+            assert self.bias.shape == (out_features,), \
+                f"Bias shape must be ({out_features},), got {self.bias.shape}"
+            y = y + self.bias.astype(np.int32).reshape(1, -1)
+        y = np.clip(y, -128, 127).astype(np.int8)
 
         if self.relu:
             a = np.maximum(0, y)
@@ -86,12 +94,21 @@ class DenseLayer(AIELayer):
         f.write(', '.join(str(int(x)) for x in weight_tiled))
         f.write(' };\n\n')
 
+        if self.bias is not None:
+            f.write(f'__attribute__((section(".data"))) alignas(32) int8_t b_p [{self.bias.size}] = {{ ')
+            f.write(', '.join(str(int(x)) for x in self.bias.astype(np.int8).reshape(-1)))
+            f.write(' };\n\n')
+
         f.write('#include "kernels.h"\n\n')
 
         relu_str = 'true' if self.relu else 'false'
         f.write(f'void f{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-        f.write(f'dense<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {relu_str}>')
-        f.write(' (x, a, k_p);}\n')
+        if self.bias is not None:
+            f.write(f'dense_bias<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {relu_str}>')
+            f.write(' (x, a, k_p, b_p);}\n')
+        else:
+            f.write(f'dense<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {relu_str}>')
+            f.write(' (x, a, k_p);}\n')
 
         self._generate_include_code()
 

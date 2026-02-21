@@ -1,12 +1,12 @@
-# np_mha_linear.py
 import numpy as np
 
-def _choose_shift(acc_int32):
+from .softmax_lut import build_exp_lut_256, softmax_lut_int8_rowwise
+
+
+def _choose_shift(acc_int32: np.ndarray) -> int:
     max_abs = int(np.max(np.abs(acc_int32))) if acc_int32.size else 0
-    if max_abs <= 127: 
+    if max_abs <= 127:
         return 0
-    # ceil(log2(max_abs/127))
-    # (avoid log for determinism)
     shift = 0
     limit = 127
     while max_abs > limit and shift < 31:
@@ -14,139 +14,192 @@ def _choose_shift(acc_int32):
         limit <<= 1
     return shift
 
-def _quantize_gemm(x_int8_2d, W_int8_2d, relu=False):
+
+def _quantize_gemm(
+    x_int8_2d: np.ndarray,
+    w_int8_2d: np.ndarray,
+    bias_int8_1d: np.ndarray | None = None,
+    relu: bool = False,
+) -> tuple[np.ndarray, int]:
     """
-    y = x @ W with int32 accum, then >> shift and saturate to int8.
-    x_int8_2d: (N, C), W_int8_2d: (C, C) -> y_int8: (N, C)
+    y = x @ w with int32 accum, then >> shift, optional int8 bias add, and saturation to int8.
     """
-    acc = x_int8_2d.astype(np.int32) @ W_int8_2d.astype(np.int32)
+    acc = x_int8_2d.astype(np.int32) @ w_int8_2d.astype(np.int32)
     shift = _choose_shift(acc)
     y = (acc >> shift).astype(np.int32)
+    if bias_int8_1d is not None:
+        y = y + bias_int8_1d.astype(np.int32).reshape(1, -1)
     y = np.clip(y, -128, 127).astype(np.int8)
     if relu:
         y = np.maximum(y, 0)
     return y, shift
 
+
 class NumpyMHALinear:
     """
-    Linear-only Multi-Head Attention (NumPy, int8 I/O, exportable Q/K/V/O GEMMs).
-
-    - Call with (B,T,C) or (T,C). If k/v are None, uses q (self-attention).
-    - Records four linear ops into `layers`: {name, x, k, y, a, shift, is_relu=False}
-      where x/k/y/a are all int8. (No nonlinear ops are recorded.)
-    - Set `name_prefix` to get entries like mha1_Wq, mha1_Wk, ...
+    Int8 MHA with optional LUT softmax and support for cross-attention (Tq != Tk).
     """
-    def __init__(self, d_model, num_heads, name_prefix, Wq, Wk, Wv, Wo):
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        name_prefix: str,
+        Wq: np.ndarray,
+        Wk: np.ndarray,
+        Wv: np.ndarray,
+        Wo: np.ndarray,
+        bq: np.ndarray | None = None,
+        bk: np.ndarray | None = None,
+        bv: np.ndarray | None = None,
+        bo: np.ndarray | None = None,
+        use_softmax: bool = True,
+        output_relu: bool = False,
+        exp_lut: np.ndarray | None = None,
+    ) -> None:
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
         self.C = d_model
         self.H = num_heads
         self.dh = d_model // num_heads
         self.name = str(name_prefix)
-        
-        # All weight matrices are now required parameters
-        self.Wq = Wq
-        self.Wk = Wk
-        self.Wv = Wv
-        self.Wo = Wo
+
+        self.Wq = Wq.astype(np.int8)
+        self.Wk = Wk.astype(np.int8)
+        self.Wv = Wv.astype(np.int8)
+        self.Wo = Wo.astype(np.int8)
+        self.bq = None if bq is None else np.clip(bq, -128, 127).astype(np.int8)
+        self.bk = None if bk is None else np.clip(bk, -128, 127).astype(np.int8)
+        self.bv = None if bv is None else np.clip(bv, -128, 127).astype(np.int8)
+        self.bo = None if bo is None else np.clip(bo, -128, 127).astype(np.int8)
+
+        self.use_softmax = use_softmax
+        self.output_relu = output_relu
+        self.exp_lut = build_exp_lut_256() if exp_lut is None else exp_lut
 
     def __call__(self, q, k=None, v=None, layers=None, training=False):
-        # Normalize to (B,T,C)
         def to_btc(t):
-            if t.ndim == 2:  # (T,C)
+            if t.ndim == 2:
                 return t[None, ...], True
-            if t.ndim == 3:  # (B,T,C)
+            if t.ndim == 3:
                 return t, False
             raise ValueError("Expected (T,C) or (B,T,C)")
+
         q_btc, squeezed = to_btc(q)
         k_btc, _ = to_btc(k if k is not None else q)
         v_btc, _ = to_btc(v if v is not None else q)
 
-        B, T, C = q_btc.shape
-        assert C == self.C, f"Expected last dim {self.C}, got {C}"
+        Bq, Tq, Cq = q_btc.shape
+        Bk, Tk, Ck = k_btc.shape
+        Bv, Tv, Cv = v_btc.shape
 
-        # Ensure int8 inputs
+        assert Bq == Bk == Bv, "Batch dimensions must match"
+        assert Cq == Ck == Cv == self.C, f"Expected channel dim {self.C}"
+        assert Tk == Tv, "Key/value sequence lengths must match"
+
         q8 = np.clip(q_btc, -128, 127).astype(np.int8)
         k8 = np.clip(k_btc, -128, 127).astype(np.int8)
         v8 = np.clip(v_btc, -128, 127).astype(np.int8)
 
-        # ----- Linear Q/K/V (exportable) -----
-        BT = B * T
-        q2d = q8.reshape(BT, C)
-        k2d = k8.reshape(BT, C)
-        v2d = v8.reshape(BT, C)
+        q2d = q8.reshape(Bq * Tq, self.C)
+        k2d = k8.reshape(Bk * Tk, self.C)
+        v2d = v8.reshape(Bv * Tv, self.C)
 
-        q_proj, sh_q = _quantize_gemm(q2d, self.Wq)  # (BT,C) int8; (160,64)@(64,64)
-        k_proj, sh_k = _quantize_gemm(k2d, self.Wk)
-        v_proj, sh_v = _quantize_gemm(v2d, self.Wv)
+        q_proj, sh_q = _quantize_gemm(q2d, self.Wq, self.bq)
+        k_proj, sh_k = _quantize_gemm(k2d, self.Wk, self.bk)
+        v_proj, sh_v = _quantize_gemm(v2d, self.Wv, self.bv)
 
         if layers is not None:
-            # Store Q layer with shift_scores and shift_context for later retrieval
-            layers.append({'name': f'{self.name}_Wq', 'x': q2d, 'k': self.Wq,
-                           'y': q_proj, 'a': q_proj, 'shift': sh_q, 'is_relu': False,
-                           'shift_scores': None, 'shift_context': None})  # Will be filled after attention
-            layers.append({'name': f'{self.name}_Wk', 'x': k2d, 'k': self.Wk,
-                           'y': k_proj, 'a': k_proj, 'shift': sh_k, 'is_relu': False})
-            layers.append({'name': f'{self.name}_Wv', 'x': v2d, 'k': self.Wv,
-                           'y': v_proj, 'a': v_proj, 'shift': sh_v, 'is_relu': False})
+            layers.append(
+                {
+                    "name": f"{self.name}_Wq",
+                    "x": q2d,
+                    "k": self.Wq,
+                    "b": self.bq,
+                    "y": q_proj,
+                    "a": q_proj,
+                    "shift": sh_q,
+                    "is_relu": False,
+                    "shift_scores": None,
+                    "shift_context": None,
+                    "use_softmax": self.use_softmax,
+                }
+            )
+            layers.append(
+                {
+                    "name": f"{self.name}_Wk",
+                    "x": k2d,
+                    "k": self.Wk,
+                    "b": self.bk,
+                    "y": k_proj,
+                    "a": k_proj,
+                    "shift": sh_k,
+                    "is_relu": False,
+                }
+            )
+            layers.append(
+                {
+                    "name": f"{self.name}_Wv",
+                    "x": v2d,
+                    "k": self.Wv,
+                    "b": self.bv,
+                    "y": v_proj,
+                    "a": v_proj,
+                    "shift": sh_v,
+                    "is_relu": False,
+                }
+            )
 
-        qh = q_proj.reshape(B, T, self.H, self.dh).transpose(0, 2, 1, 3)  # (B,H,T,dh)
-        kh = k_proj.reshape(B, T, self.H, self.dh).transpose(0, 2, 1, 3)
-        vh = v_proj.reshape(B, T, self.H, self.dh).transpose(0, 2, 1, 3)
+        qh = q_proj.reshape(Bq, Tq, self.H, self.dh).transpose(0, 2, 1, 3)  # (B,H,Tq,dh)
+        kh = k_proj.reshape(Bk, Tk, self.H, self.dh).transpose(0, 2, 1, 3)  # (B,H,Tk,dh)
+        vh = v_proj.reshape(Bv, Tv, self.H, self.dh).transpose(0, 2, 1, 3)  # (B,H,Tk,dh)
 
-        # ----- Linear attention core (NO softmax; nonlinear parts commented) -----
-        ctx_h = np.empty_like(vh)  # (B,H,T,dh), int8
+        ctx_h = np.zeros((Bq, self.H, Tq, self.dh), dtype=np.int8)
         sh_s_heads = np.empty(self.H, dtype=int)
         sh_c_heads = np.empty(self.H, dtype=int)
 
-        for b in range(B):
+        for b in range(Bq):
             for h in range(self.H):
-                Q = qh[b, h].astype(np.int32)              # (T,dh)
-                Kt = kh[b, h].astype(np.int32).T           # (dh,T)
-                scores_acc = Q @ Kt                         # (T,T) int32 //LAYER
+                Q = qh[b, h].astype(np.int32)     # (Tq, dh)
+                Kt = kh[b, h].astype(np.int32).T  # (dh, Tk)
+                scores_acc = Q @ Kt               # (Tq, Tk)
 
-                # # NONLINEAR (commented): scaling and softmax
-                # # scale = 1.0 / math.sqrt(self.dh)     # float
-                # # scores = scores_acc * scale
-                # # attn = softmax(scores, axis=-1)      # non-linear
-                # # if training and dropout>0: apply dropout mask
-                # Quantize scores to int8
                 sh_s = _choose_shift(scores_acc)
                 sh_s_heads[h] = sh_s
-                scores_q = np.clip(scores_acc >> sh_s, -128, 127).astype(np.int8)  # (T,T)
+                scores_q = np.clip(scores_acc >> sh_s, -128, 127).astype(np.int8)
 
-                V = vh[b, h].astype(np.int32)               # (T,dh), promote for accum
-                ctx_acc = scores_q.astype(np.int32) @ V     # (T,dh) int32
+                if self.use_softmax:
+                    attn_q = softmax_lut_int8_rowwise(scores_q, exp_lut=self.exp_lut)
+                else:
+                    attn_q = scores_q
+
+                V = vh[b, h].astype(np.int32)            # (Tk, dh)
+                ctx_acc = attn_q.astype(np.int32) @ V    # (Tq, dh)
 
                 sh_c = _choose_shift(ctx_acc)
                 sh_c_heads[h] = sh_c
-                ctx_q = np.clip(ctx_acc >> sh_c, -128, 127).astype(np.int8)  # (T,dh)
-
+                ctx_q = np.clip(ctx_acc >> sh_c, -128, 127).astype(np.int8)
                 ctx_h[b, h] = ctx_q
 
-        # Concat heads -> (B,T,C) int8
-        ctx = ctx_h.transpose(0, 2, 1, 3).reshape(B, T, C)
+        ctx = ctx_h.transpose(0, 2, 1, 3).reshape(Bq, Tq, self.C)
+        ctx2d = ctx.reshape(Bq * Tq, self.C)
+        out_proj, sh_o = _quantize_gemm(ctx2d, self.Wo, self.bo, relu=self.output_relu)
 
-        # ----- Output linear (exportable) -----
-        ctx2d = ctx.reshape(BT, C)  # int8
-        out_proj, sh_o = _quantize_gemm(ctx2d, self.Wo, relu=True)
-
-        # for debug
         if layers is not None:
-            layers.append({'name': f'{self.name}_Wo', 'x': ctx2d, 'k': self.Wo,
-                           'y': out_proj, 'a': out_proj, 'shift': sh_o, 'is_relu': True})
-
-            # Update the Wq layer with the computed shift values for scores and context
-            # Find the Wq layer (it's 4 layers back from the current position)
+            layers.append(
+                {
+                    "name": f"{self.name}_Wo",
+                    "x": ctx2d,
+                    "k": self.Wo,
+                    "b": self.bo,
+                    "y": out_proj,
+                    "a": out_proj,
+                    "shift": sh_o,
+                    "is_relu": self.output_relu,
+                }
+            )
             wq_idx = len(layers) - 4
-            layers[wq_idx]['shift_scores'] = sh_s_heads.tolist()
-            layers[wq_idx]['shift_context'] = sh_c_heads.tolist()
+            layers[wq_idx]["shift_scores"] = sh_s_heads.tolist()
+            layers[wq_idx]["shift_context"] = sh_c_heads.tolist()
 
-        print(f"SHIFT_Q = {sh_q}")
-        print(f"SHIFT_K = {sh_k}")
-        print(f"SHIFT_V = {sh_v}")
-        print(f"SHIFT_S (per head) = {sh_s_heads}")
-        print(f"SHIFT_C (per head) = {sh_c_heads}")
-        print(f"SHIFT_O = {sh_o}")
-
-        out = out_proj.reshape(B, T, C)  # int8
+        out = out_proj.reshape(Bq, Tq, self.C)
         return out[0] if squeezed else out

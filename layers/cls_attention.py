@@ -7,7 +7,12 @@ from utils.np_mha_linear import NumpyMHALinear
 from utils.softmax_lut import build_exp_lut_256, lut_to_c_initializer
 
 
-class MHALayer(AIELayer):
+class CLSAttentionLayer(AIELayer):
+    """
+    CLS cross-attention:
+      - Mode A: internal CLS query + particle K/V input.
+      - Mode B: explicit CLS input + particle K/V input.
+    """
 
     def __init__(
         self,
@@ -17,16 +22,20 @@ class MHALayer(AIELayer):
         Wv: np.ndarray,
         Wo: np.ndarray,
         num_heads: int,
-        d_model: int = 64,
-        T: int = 160,
+        d_model: int,
+        T_kv: int,
+        T_q: int,
+        internal_cls_query: bool,
+        cls_token: Optional[np.ndarray] = None,
         bq: Optional[np.ndarray] = None,
         bk: Optional[np.ndarray] = None,
         bv: Optional[np.ndarray] = None,
         bo: Optional[np.ndarray] = None,
         use_softmax: bool = True,
+        add_query_residual: bool = False,
         output_relu: bool = False,
     ):
-        super().__init__(name, 'mha', params={
+        super().__init__(name, 'cls_attention', params={
             'Wq': Wq,
             'Wk': Wk,
             'Wv': Wv,
@@ -37,8 +46,11 @@ class MHALayer(AIELayer):
             'bo': bo,
             'num_heads': num_heads,
             'd_model': d_model,
-            'T': T,
+            'T_kv': T_kv,
+            'T_q': T_q,
+            'internal_cls_query': internal_cls_query,
             'use_softmax': use_softmax,
+            'add_query_residual': add_query_residual,
             'output_relu': output_relu,
         })
 
@@ -53,17 +65,26 @@ class MHALayer(AIELayer):
 
         self.num_heads = num_heads
         self.d_model = d_model
-        self.T = T
+        self.T_kv = T_kv
+        self.T_q = T_q
         self.head_dim = d_model // num_heads
+        self.internal_cls_query = internal_cls_query
+        self.add_query_residual = add_query_residual
         self.use_softmax = use_softmax
         self.output_relu = output_relu
+
+        self.cls_token = None if cls_token is None else np.clip(cls_token, -128, 127).astype(np.int8)
+        if self.internal_cls_query:
+            assert self.cls_token is not None, "cls_token is required for internal CLS query mode."
+            assert self.cls_token.shape == (self.d_model,), \
+                f"cls_token shape must be ({self.d_model},), got {self.cls_token.shape}"
+
+        assert d_model % num_heads == 0, f"d_model {d_model} must be divisible by num_heads {num_heads}"
+        assert num_heads in [1, 4], f"Only num_heads=1 or 4 supported, got {num_heads}"
 
         self.m = None
         self.k = None
         self.n = None
-
-        assert d_model % num_heads == 0, f"d_model {d_model} must be divisible by num_heads {num_heads}"
-        assert num_heads in [1, 4], f"Only num_heads=1 or 4 supported, got {num_heads}"
 
         self.shift_q = None
         self.shift_k = None
@@ -80,6 +101,7 @@ class MHALayer(AIELayer):
         self.bq_heads = []
         self.bk_heads = []
         self.bv_heads = []
+        self.q_proj_heads_const_tiled = []
 
         self.softmax_lut = build_exp_lut_256()
 
@@ -95,13 +117,25 @@ class MHALayer(AIELayer):
         return out
 
     def _compute_golden(self, inputs: List[np.ndarray]) -> np.ndarray:
-        self.validate_inputs(inputs, expected_count=1)
-        x = inputs[0]
+        expected_count = 1 if self.internal_cls_query else 2
+        self.validate_inputs(inputs, expected_count=expected_count)
 
         assert self.m is not None and self.k is not None and self.n is not None, \
             "Tiling parameters not set. Layer must be added to AIEModel first."
-        assert x.shape == (self.T, self.d_model), \
-            f"Expected input shape ({self.T}, {self.d_model}), got {x.shape}"
+        assert self.T_q % self.m == 0, f"T_q={self.T_q} must be divisible by m={self.m}"
+        assert self.T_kv % self.m == 0, f"T_kv={self.T_kv} must be divisible by m={self.m}"
+
+        if self.internal_cls_query:
+            kv = inputs[0]
+            q_in = np.repeat(self.cls_token.reshape(1, -1), self.T_q, axis=0).astype(np.int8)
+        else:
+            q_in = inputs[0]
+            kv = inputs[1]
+
+        assert q_in.shape == (self.T_q, self.d_model), \
+            f"Expected CLS input shape ({self.T_q}, {self.d_model}), got {q_in.shape}"
+        assert kv.shape == (self.T_kv, self.d_model), \
+            f"Expected KV input shape ({self.T_kv}, {self.d_model}), got {kv.shape}"
 
         layers_list = []
         mha = NumpyMHALinear(
@@ -121,9 +155,8 @@ class MHALayer(AIELayer):
             exp_lut=self.softmax_lut,
         )
 
-        output = mha(x, x, x, layers=layers_list)
+        out = mha(q_in, kv, kv, layers=layers_list)
 
-        assert len(layers_list) == 4, f"Expected 4 layer records from MHA, got {len(layers_list)}"
         layer_q = layers_list[0]
         layer_k = layers_list[1]
         layer_v = layers_list[2]
@@ -136,34 +169,75 @@ class MHALayer(AIELayer):
         self.shift_c = layer_q['shift_context']
         self.shift_o = layer_o['shift']
 
+        q_proj_full = layer_q['a'].reshape(self.T_q, self.d_model).astype(np.int8)
+
         self.Wq_heads = []
         self.Wk_heads = []
         self.Wv_heads = []
+        self.q_proj_heads_const_tiled = []
 
         for h in range(self.num_heads):
-            col_start = h * self.head_dim
-            col_end = (h + 1) * self.head_dim
-
-            Wq_h = self.Wq[:, col_start:col_end]
-            Wk_h = self.Wk[:, col_start:col_end]
-            Wv_h = self.Wv[:, col_start:col_end]
-
-            self.Wq_heads.append(tile_matrix(Wq_h, self.k, self.n))
-            self.Wk_heads.append(tile_matrix(Wk_h, self.k, self.n))
-            self.Wv_heads.append(tile_matrix(Wv_h, self.k, self.n))
+            s = h * self.head_dim
+            e = (h + 1) * self.head_dim
+            self.Wq_heads.append(tile_matrix(self.Wq[:, s:e], self.k, self.n))
+            self.Wk_heads.append(tile_matrix(self.Wk[:, s:e], self.k, self.n))
+            self.Wv_heads.append(tile_matrix(self.Wv[:, s:e], self.k, self.n))
+            self.q_proj_heads_const_tiled.append(tile_matrix(q_proj_full[:, s:e], self.m, self.n))
 
         self.Wo_tiled = tile_matrix(self.Wo, self.k, self.n)
-
         self.bq_heads = self._split_head_bias(self.bq)
         self.bk_heads = self._split_head_bias(self.bk)
         self.bv_heads = self._split_head_bias(self.bv)
 
-        self.outputs['a'] = output
-        self._golden_computed = True
-        return output
+        if self.add_query_residual:
+            out = np.clip(out.astype(np.int32) + q_in.astype(np.int32), -128, 127).astype(np.int8)
 
-    def _write_qkv_kernel(self, fpath: str, fn_name: str, weight_tiled: np.ndarray, bias: Optional[np.ndarray], shift: int):
-        with open(fpath, "w") as f:
+        self.outputs['q_in'] = q_in
+        self.outputs['kv_in'] = kv
+        self.outputs['a'] = out
+        self._golden_computed = True
+        return out
+
+    def _write_q_kernel(self, h: int):
+        if self.internal_cls_query:
+            with open(f"aie/layer_{self.idx}_q_head{h}.cc", "w") as fq:
+                fq.write('#include <cstdint>\n')
+                q_const = self.q_proj_heads_const_tiled[h]
+                fq.write(f'__attribute__((section(".data"))) alignas(32) int8_t q_p [{q_const.size}] = {{ ')
+                fq.write(', '.join(str(int(x)) for x in q_const))
+                fq.write(' };\n\n')
+                fq.write('#include "kernels.h"\n\n')
+                fq.write(
+                    f'void q{self.idx}_head{h}(output_stream_int8 * __restrict a){{ '
+                    f'emit_const<{self.m}, {self.n}, {self.T_q//self.m}, {self.head_dim//self.n}>(a, q_p);'
+                    f'}}\n'
+                )
+        else:
+            with open(f"aie/layer_{self.idx}_q_head{h}.cc", "w") as fq:
+                fq.write('#include <cstdint>\n')
+                fq.write(f'__attribute__((section(".data"))) alignas(32) int8_t k_p [{self.Wq_heads[h].size}] = {{ ')
+                fq.write(', '.join(str(int(x)) for x in self.Wq_heads[h]))
+                fq.write(' };\n\n')
+                if self.bq_heads[h] is not None:
+                    fq.write(f'__attribute__((section(".data"))) alignas(32) int8_t b_p [{self.bq_heads[h].size}] = {{ ')
+                    fq.write(', '.join(str(int(x)) for x in self.bq_heads[h]))
+                    fq.write(' };\n\n')
+                fq.write('#include "kernels.h"\n\n')
+                fq.write(f'void q{self.idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
+                if self.bq_heads[h] is not None:
+                    fq.write(
+                        f'dense_bias<{self.m}, {self.k}, {self.n}, {self.T_q//self.m}, {self.d_model//self.k}, '
+                        f'{self.head_dim//self.n}, {self.shift_q}, false>(x, a, k_p, b_p);'
+                    )
+                else:
+                    fq.write(
+                        f'dense<{self.m}, {self.k}, {self.n}, {self.T_q//self.m}, {self.d_model//self.k}, '
+                        f'{self.head_dim//self.n}, {self.shift_q}, false>(x, a, k_p);'
+                    )
+                fq.write('}\n')
+
+    def _write_kv_kernel(self, which: str, h: int, weight_tiled: np.ndarray, bias: Optional[np.ndarray], shift: int):
+        with open(f"aie/layer_{self.idx}_{which}_head{h}.cc", "w") as f:
             f.write('#include <cstdint>\n')
             f.write(f'__attribute__((section(".data"))) alignas(32) int8_t k_p [{weight_tiled.size}] = {{ ')
             f.write(', '.join(str(int(x)) for x in weight_tiled))
@@ -173,49 +247,30 @@ class MHALayer(AIELayer):
                 f.write(', '.join(str(int(x)) for x in bias.reshape(-1)))
                 f.write(' };\n\n')
             f.write('#include "kernels.h"\n\n')
-            f.write(f'void {fn_name}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
+            f.write(f'void {which}{self.idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
             if bias is not None:
                 f.write(
-                    f'dense_bias<{self.m}, {self.k}, {self.n}, {self.T//self.m}, '
-                    f'{self.d_model//self.k}, {self.head_dim//self.n}, {shift}, false>(x, a, k_p, b_p);'
+                    f'dense_bias<{self.m}, {self.k}, {self.n}, {self.T_kv//self.m}, {self.d_model//self.k}, '
+                    f'{self.head_dim//self.n}, {shift}, false>(x, a, k_p, b_p);'
                 )
             else:
                 f.write(
-                    f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, '
-                    f'{self.d_model//self.k}, {self.head_dim//self.n}, {shift}, false>(x, a, k_p);'
+                    f'dense<{self.m}, {self.k}, {self.n}, {self.T_kv//self.m}, {self.d_model//self.k}, '
+                    f'{self.head_dim//self.n}, {shift}, false>(x, a, k_p);'
                 )
             f.write('}\n')
 
     def generate_kernel_code(self, f) -> None:
         assert self._golden_computed, "Must call compute_golden() before generating code"
-
         try:
-            f.write(f"// MHA layer {self.idx}: generated via per-head source units.\n")
+            f.write(f"// CLS cross-attention layer {self.idx}\n")
         except Exception:
             pass
 
         for h in range(self.num_heads):
-            self._write_qkv_kernel(
-                fpath=f"aie/layer_{self.idx}_q_head{h}.cc",
-                fn_name=f"q{self.idx}_head{h}",
-                weight_tiled=self.Wq_heads[h],
-                bias=self.bq_heads[h],
-                shift=self.shift_q,
-            )
-            self._write_qkv_kernel(
-                fpath=f"aie/layer_{self.idx}_k_head{h}.cc",
-                fn_name=f"k{self.idx}_head{h}",
-                weight_tiled=self.Wk_heads[h],
-                bias=self.bk_heads[h],
-                shift=self.shift_k,
-            )
-            self._write_qkv_kernel(
-                fpath=f"aie/layer_{self.idx}_v_head{h}.cc",
-                fn_name=f"v{self.idx}_head{h}",
-                weight_tiled=self.Wv_heads[h],
-                bias=self.bv_heads[h],
-                shift=self.shift_v,
-            )
+            self._write_q_kernel(h)
+            self._write_kv_kernel('k', h, self.Wk_heads[h], self.bk_heads[h], self.shift_k)
+            self._write_kv_kernel('v', h, self.Wv_heads[h], self.bv_heads[h], self.shift_v)
 
             with open(f"aie/layer_{self.idx}_scores_head{h}.cc", "w") as fs:
                 fs.write('#include "kernels.h"\n\n')
@@ -224,8 +279,8 @@ class MHALayer(AIELayer):
                     f'input_stream_int8 * __restrict k_head, output_stream_int8 * __restrict o_head){{ '
                 )
                 fs.write(
-                    f'scores<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.head_dim//self.k}, '
-                    f'{self.head_dim//self.n}, {self.head_dim}, {self.T}, {self.shift_s[h]}>(q_head, k_head, o_head);'
+                    f'scores_cross<{self.m}, {self.k}, {self.n}, {self.T_q//self.m}, {self.T_kv//self.m}, '
+                    f'{self.head_dim//self.n}, {self.head_dim}, {self.shift_s[h]}>(q_head, k_head, o_head);'
                 )
                 fs.write('}\n')
 
@@ -240,18 +295,18 @@ class MHALayer(AIELayer):
                         f'void softmax{self.idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict y){{ '
                     )
                     fsm.write(
-                        f'softmax_rows<{self.m}, {self.m}, {self.T//self.m}, {self.T//self.m}>(x, y, lut_p);'
+                        f'softmax_rows<{self.m}, {self.m}, {self.T_q//self.m}, {self.T_kv//self.m}>(x, y, lut_p);'
                     )
                     fsm.write('}\n')
 
             with open(f"aie/layer_{self.idx}_context_head{h}.cc", "w") as fc:
                 fc.write('#include "kernels.h"\n\n')
                 fc.write(
-                    f'void context{self.idx}_head{h}(input_stream_int8 * __restrict x, '
-                    f'input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ '
+                    f'void context{self.idx}_head{h}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, '
+                    f'output_stream_int8 * __restrict a){{ '
                 )
                 fc.write(
-                    f'context<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.T//self.k}, '
+                    f'context_cross<{self.m}, {self.n}, {self.T_q//self.m}, {self.T_kv//self.m}, '
                     f'{self.head_dim//self.n}, {self.shift_c[h]}>(x, v, a);'
                 )
                 fc.write('}\n')
@@ -263,13 +318,13 @@ class MHALayer(AIELayer):
                     f'void concat{self.idx}_0(input_stream_int8 * __restrict sA, input_stream_int8 * __restrict sB, '
                     f'output_stream_int8 * __restrict sC){{\n'
                 )
-                fc.write(f'concat<{self.m}, {self.n}, {self.T//self.m}, {self.head_dim//self.n}>(sA, sB, sC);\n')
+                fc.write(f'concat<{self.m}, {self.n}, {self.T_q//self.m}, {self.head_dim//self.n}>(sA, sB, sC);\n')
                 fc.write('}\n\n')
                 fc.write(
                     f'void concat{self.idx}_1(input_stream_int8 * __restrict sA, input_stream_int8 * __restrict sB, '
                     f'output_stream_int8 * __restrict sC){{\n'
                 )
-                fc.write(f'concat<{self.m}, {self.n}, {self.T//self.m}, {self.head_dim//self.n}>(sA, sB, sC);\n')
+                fc.write(f'concat<{self.m}, {self.n}, {self.T_q//self.m}, {self.head_dim//self.n}>(sA, sB, sC);\n')
                 fc.write('}\n')
 
             with open(f"aie/layer_{self.idx}_out.cc", "w") as fo:
@@ -281,23 +336,24 @@ class MHALayer(AIELayer):
                     fo.write(f'__attribute__((section(".data"))) alignas(32) int8_t b_p [{self.bo.size}] = {{ ')
                     fo.write(', '.join(str(int(x)) for x in self.bo.reshape(-1)))
                     fo.write(' };\n\n')
+                if self.add_query_residual:
+                    fo.write(f'__attribute__((section(".data"))) alignas(32) int8_t r_p [{self.cls_token.size}] = {{ ')
+                    fo.write(', '.join(str(int(x)) for x in self.cls_token.reshape(-1)))
+                    fo.write(' };\n\n')
                 fo.write('#include "kernels.h"\n\n')
                 fo.write(
                     f'void out{self.idx}(input_stream_int8 * __restrict sA, input_stream_int8 * __restrict sB, '
                     f'output_stream_int8 * __restrict a){{'
                 )
-                use_bias = 'true' if self.bo is not None else 'false'
                 is_relu = 'true' if self.output_relu else 'false'
-                if self.bo is not None:
-                    fo.write(
-                        f'output<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, '
-                        f'{self.d_model//self.n}, {self.shift_o}, {is_relu}, {use_bias}, false>(sA, sB, a, k_p, b_p, nullptr);'
-                    )
-                else:
-                    fo.write(
-                        f'output<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, '
-                        f'{self.d_model//self.n}, {self.shift_o}, {is_relu}, {use_bias}, false>(sA, sB, a, k_p, nullptr, nullptr);'
-                    )
+                use_bias = 'true' if self.bo is not None else 'false'
+                use_residual = 'true' if self.add_query_residual else 'false'
+                bias_ptr = 'b_p' if self.bo is not None else 'nullptr'
+                res_ptr = 'r_p' if self.add_query_residual else 'nullptr'
+                fo.write(
+                    f'output<{self.m}, {self.k}, {self.n}, {self.T_q//self.m}, {self.d_model//self.k}, {self.d_model//self.n}, '
+                    f'{self.shift_o}, {is_relu}, {use_bias}, {use_residual}>(sA, sB, a, k_p, {bias_ptr}, {res_ptr});'
+                )
                 fo.write('}\n')
 
         elif self.num_heads == 1:
@@ -314,12 +370,12 @@ class MHALayer(AIELayer):
                 fo.write(f'void out{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
                 if self.bo is not None:
                     fo.write(
-                        f'dense_bias<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, '
+                        f'dense_bias<{self.m}, {self.k}, {self.n}, {self.T_q//self.m}, {self.d_model//self.k}, '
                         f'{self.d_model//self.n}, {self.shift_o}, false>(x, a, k_p, b_p);'
                     )
                 else:
                     fo.write(
-                        f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, '
+                        f'dense<{self.m}, {self.k}, {self.n}, {self.T_q//self.m}, {self.d_model//self.k}, '
                         f'{self.d_model//self.n}, {self.shift_o}, false>(x, a, k_p);'
                     )
                 fo.write('}\n')
@@ -329,7 +385,10 @@ class MHALayer(AIELayer):
     def _generate_include_code(self) -> None:
         with open("aie/include.h", "a") as f:
             for h in range(self.num_heads):
-                f.write(f'void q{self.idx}_head{h}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
+                if self.internal_cls_query:
+                    f.write(f'void q{self.idx}_head{h}(output_stream_int8 * __restrict);\n')
+                else:
+                    f.write(f'void q{self.idx}_head{h}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
                 f.write(f'void k{self.idx}_head{h}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
                 f.write(f'void v{self.idx}_head{h}(input_stream_int8 * __restrict, output_stream_int8 * __restrict);\n')
                 f.write(
@@ -354,8 +413,15 @@ class MHALayer(AIELayer):
         return 6 if self.use_softmax else 5
 
     def generate_graph_code(self, f, input_ports: List[str]) -> None:
-        self.validate_inputs(input_ports, expected_count=1)
-        in_port = input_ports[0]
+        expected = 1 if self.internal_cls_query else 2
+        self.validate_inputs(input_ports, expected_count=expected)
+
+        if self.internal_cls_query:
+            token_port = input_ports[0]
+            cls_port = None
+        else:
+            cls_port = input_ports[0]
+            token_port = input_ports[1]
 
         stride = self._head_kernel_stride()
         for h in range(self.num_heads):
@@ -370,23 +436,25 @@ class MHALayer(AIELayer):
             f.write(f"        {self.name}[{q_idx}] = kernel::create(::q{self.idx}_head{h});\n")
             f.write(f'        source({self.name}[{q_idx}]) = "layer_{self.idx}_q_head{h}.cc";\n')
             f.write(f'        runtime<ratio>({self.name}[{q_idx}]) = 1.0;\n')
-            f.write(f"        connect<stream>({in_port}.out[0], {self.name}[{q_idx}].in[0]);\n\n")
+            if not self.internal_cls_query:
+                f.write(f"        connect<stream>({cls_port}.out[0], {self.name}[{q_idx}].in[0]);\n")
+            f.write('\n')
 
             f.write(f"        {self.name}[{k_idx}] = kernel::create(::k{self.idx}_head{h});\n")
             f.write(f'        source({self.name}[{k_idx}]) = "layer_{self.idx}_k_head{h}.cc";\n')
             f.write(f'        runtime<ratio>({self.name}[{k_idx}]) = 1.0;\n')
-            f.write(f"        connect<stream>({in_port}.out[0], {self.name}[{k_idx}].in[0]);\n\n")
+            f.write(f"        connect<stream>({token_port}.out[0], {self.name}[{k_idx}].in[0]);\n\n")
 
             f.write(f"        {self.name}[{v_idx}] = kernel::create(::v{self.idx}_head{h});\n")
             f.write(f'        source({self.name}[{v_idx}]) = "layer_{self.idx}_v_head{h}.cc";\n')
             f.write(f'        runtime<ratio>({self.name}[{v_idx}]) = 1.0;\n')
-            f.write(f"        connect<stream>({in_port}.out[0], {self.name}[{v_idx}].in[0]);\n\n")
+            f.write(f"        connect<stream>({token_port}.out[0], {self.name}[{v_idx}].in[0]);\n\n")
 
             f.write(f"        {self.name}[{scores_idx}] = kernel::create(::scores{self.idx}_head{h});\n")
             f.write(f'        source({self.name}[{scores_idx}]) = "layer_{self.idx}_scores_head{h}.cc";\n')
             f.write(f'        runtime<ratio>({self.name}[{scores_idx}]) = 1.0;\n')
             f.write(f"        connect<stream> s{self.idx}_{h}_qk({self.name}[{q_idx}].out[0], {self.name}[{scores_idx}].in[0]);\n")
-            f.write(f"        fifo_depth(s{self.idx}_{h}_qk) = {int(self.T * self.head_dim / 4)};\n")
+            f.write(f"        fifo_depth(s{self.idx}_{h}_qk) = {int(self.T_q * self.head_dim / 4)};\n")
             f.write(f"        connect<stream>({self.name}[{k_idx}].out[0], {self.name}[{scores_idx}].in[1]);\n\n")
 
             if self.use_softmax:
@@ -403,7 +471,7 @@ class MHALayer(AIELayer):
                 f"        connect<stream> s{self.idx}_{h}_sv({self.name}[{src_for_context}].out[0], "
                 f"{self.name}[{context_idx}].in[0]);\n"
             )
-            f.write(f"        fifo_depth(s{self.idx}_{h}_sv) = {int(self.T * self.T / 4)};\n")
+            f.write(f"        fifo_depth(s{self.idx}_{h}_sv) = {int(self.T_q * self.T_kv / 4)};\n")
             f.write(f"        connect<stream>({self.name}[{v_idx}].out[0], {self.name}[{context_idx}].in[1]);\n\n")
 
         if self.num_heads == 4:
@@ -437,11 +505,10 @@ class MHALayer(AIELayer):
         elif self.num_heads == 1:
             out_idx = stride
             context_idx = stride - 1
-
             f.write(f"        {self.name}[{out_idx}] = kernel::create(::out{self.idx});\n")
             f.write(f'        source({self.name}[{out_idx}]) = "layer_{self.idx}_out.cc";\n')
             f.write(f'        runtime<ratio>({self.name}[{out_idx}]) = 1.0;\n')
-            f.write(f'        connect<stream>({self.name}[{context_idx}].out[0], {self.name}[{out_idx}].in[0]);\n\n')
+            f.write(f"        connect<stream>({self.name}[{context_idx}].out[0], {self.name}[{out_idx}].in[0]);\n\n")
 
     def num_kernels(self) -> int:
         stride = self._head_kernel_stride()
@@ -453,10 +520,3 @@ class MHALayer(AIELayer):
 
     def get_output_port(self, port_idx: int = 0) -> str:
         return f"{self.name}[{self.num_kernels() - 1}]"
-
-    def __repr__(self) -> str:
-        idx_str = f"idx={self.idx}" if self.idx is not None else "idx=unassigned"
-        return (
-            f"MHALayer({idx_str}, name='{self.name}', num_heads={self.num_heads}, "
-            f"d_model={self.d_model}, use_softmax={self.use_softmax}, num_kernels={self.num_kernels()})"
-        )
