@@ -189,7 +189,7 @@ def build_model(
         W2, b2, s2 = _linear_from_loader(
             loader, f"mod.blocks.{i}.fc2", cfg.ffn_dim, d_model, ffn_dim_pad, d_model, cfg.default_shift
         )
-        ff2 = DenseLayer(name=f"blocks_{i}_ff2", weight=W2, shift=s2, bias=b2, relu=True)
+        ff2 = DenseLayer(name=f"blocks_{i}_ff2", weight=W2, shift=s2, bias=b2, relu=False)
         model.add_layer(ff2, inputs=[ff1])
 
         res_ffn = ResAddLayer(name=f"blocks_{i}_res_ffn")
@@ -245,7 +245,7 @@ def build_model(
         W2, b2, s2 = _linear_from_loader(
             loader, f"mod.cls_blocks.{i}.fc2", cfg.ffn_dim, d_model, ffn_dim_pad, d_model, cfg.default_shift
         )
-        cls_ff2 = DenseLayer(name=f"cls_blocks_{i}_ff2", weight=W2, shift=s2, bias=b2, relu=True)
+        cls_ff2 = DenseLayer(name=f"cls_blocks_{i}_ff2", weight=W2, shift=s2, bias=b2, relu=False)
         model.add_layer(cls_ff2, inputs=[cls_ff1])
 
         cls_res_ffn = ResAddLayer(name=f"cls_blocks_{i}_res_ffn")
