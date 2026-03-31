@@ -49,7 +49,7 @@ void dense(
 
 // (Q @ K^T):  (T, d_model) @ (T, d_model)^T -> (T, T)
 // m=4, k=8, n=8, T=160, d_model=64, Tm(rows)=160/m=40, Tn(columns)=64/n=8
-template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int SHIFT_S>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int B, int SOFTMAX_BIT>
 void scores(
   input_stream_int8 * __restrict sQ, // adf::input_buffer<int8, adf::extents<T*d_model>> & sQ,
   input_stream_int8 * __restrict sK, // adf::input_buffer<int8, adf::extents<T*d_model>> & sK,
@@ -58,9 +58,39 @@ void scores(
   using MMUL = aie::mmul<m, n, m, int8, int8>; // 4x8x4
   using VA   = aie::vector<int8, MMUL::size_A>; // 4x8
   using VB   = aie::vector<int8, MMUL::size_A>; // 8x4
-  using VC   = aie::vector<int8, MMUL::size_C>; // 4x4
+  using VC32 = aie::vector<int32, MMUL::size_C>; // 4x4 int32
+  using VC8  = aie::vector<int8, MMUL::size_C>;  // 4x4 int8
 
   VB matB[Tm*Tn]; //store all of matB in mem
+
+  // IntSoftmax polynomial parameters (aligned with NumPy golden path).
+  // softmax scaling factor: s = 2^-B
+  constexpr int N_EXP = 30;
+  static_assert(SOFTMAX_BIT > 0 && SOFTMAX_BIT <= 7, "SOFTMAX_BIT must be in [1, 7] for signed int8 stream");
+  const int b_eff = (B < 0) ? 0 : ((B > 18) ? 18 : B);
+  const int64 scale_mul = (int64)1 << b_eff; // 2^B
+
+  // x0_int = floor(-0.6931 * 2^B) = -ceil(6931 * 2^B / 10000)
+  const int64 x0_num = 6931LL * scale_mul;
+  const int X0_INT = -(int)((x0_num + 9999LL) / 10000LL);
+
+  // B_INT = floor((0.96963238 / 0.35815147) * 2^B)
+  const int64 b_num = 96963238LL * scale_mul;
+  const int B_INT = (int)(b_num / 35815147LL);
+
+  // C_INT = floor((1.0 / 0.35815147) * 2^(2B))
+  const int64 scale_mul_sq = scale_mul * scale_mul;
+  const int64 c_num = 100000000LL * scale_mul_sq;
+  const int C_INT = (int)(c_num / 35815147LL);
+
+  auto floor_div = [](int a, int b) -> int {
+    int q = a / b;
+    int r = a % b;
+    if ((r != 0) && ((r > 0) != (b > 0))) {
+      --q;
+    }
+    return q;
+  };
 
   for (unsigned i = 0; i < Tm; ++i) { // rows
     for (unsigned j = 0; j < Tn; ++j) { // columns
@@ -68,20 +98,83 @@ void scores(
     }
   }
   
-  // row by row multiplication
+  // Row-wise fused scores+softmax.
   for (unsigned im = 0; im < Tm; ++im) {   // rows of Q
     VA Abuf[Tn]; // row of tiles
+    int32 row_scores[m][T];
+    int8 row_probs[m][T];
+
     for (unsigned in = 0; in < Tn; ++in) { // columns of Q
       Abuf[in] = readincr_v<MMUL::size_A>(sQ);
     }
+
+    // Build full int32 score rows for this 4-row stripe.
     for (unsigned jm = 0; jm < Tm; ++jm) { // rows of K
       MMUL C;
       for (unsigned in = 0; in < Tn; ++in) { // columns of K
         if (in == 0) C.mul(Abuf[0], matB[jm*Tn+in]);
         else         C.mac(Abuf[in], matB[jm*Tn+in]);
       }
-      VC V = C.template to_vector<int8>(SHIFT_S);
-      writeincr(sS, V);
+      VC32 V = C.template to_vector<int32>(0);
+
+      const unsigned base_col = jm * m;
+      for (unsigned r = 0; r < m; ++r) {
+        for (unsigned c = 0; c < m; ++c) {
+          row_scores[r][base_col + c] = V[r * m + c];
+        }
+      }
+    }
+
+    // Row-wise integer softmax on int32 score rows.
+    for (unsigned r = 0; r < m; ++r) {
+      int32 row_max = row_scores[r][0];
+      for (unsigned col = 1; col < T; ++col) {
+        if (row_scores[r][col] > row_max) row_max = row_scores[r][col];
+      }
+
+      int64 exp_vals[T];
+      int64 exp_sum = 0;
+
+      for (unsigned col = 0; col < T; ++col) {
+        int x = row_scores[r][col] - row_max;
+        const int min_x = N_EXP * X0_INT;
+        if (x < min_x) x = min_x;
+
+        const int q = floor_div(x, X0_INT);
+        const int rem = x - X0_INT * q;
+
+        int64 z = (int64)rem * (int64)(rem + B_INT) + (int64)C_INT;
+        int shift = N_EXP - q;
+        if (shift < 0) shift = 0;
+        if (shift > 62) shift = 62;
+
+        int64 exp_int = z << shift;
+        if (exp_int < 0) exp_int = 0;
+
+        exp_vals[col] = exp_int;
+        exp_sum += exp_int;
+      }
+
+      if (exp_sum <= 0) exp_sum = 1;
+      const uint64 factor = ((uint64)1 << 32) / (uint64)exp_sum;
+
+      for (unsigned col = 0; col < T; ++col) {
+        uint64 p = ((uint64)exp_vals[col] * factor) >> (32 - SOFTMAX_BIT);
+        if (p > 127) p = 127;
+        row_probs[r][col] = (int8)p;
+      }
+    }
+
+    // Emit in original 4x4 tile order expected by context.
+    for (unsigned jm = 0; jm < Tm; ++jm) {
+      VC8 out;
+      const unsigned base_col = jm * m;
+      for (unsigned r = 0; r < m; ++r) {
+        for (unsigned c = 0; c < m; ++c) {
+          out[r * m + c] = row_probs[r][base_col + c];
+        }
+      }
+      writeincr(sS, out);
     }
   }
 }

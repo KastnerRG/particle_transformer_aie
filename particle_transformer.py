@@ -26,7 +26,17 @@ def build_and_run(seed: int = 0):
     Wv = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
     Wo = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
 
-    mha1 = MHALayer(name='mha_1', Wq=Wq, Wk=Wk, Wv=Wv, Wo=Wo, num_heads=4, d_model=ff_dim, T=num_particles_pad)
+    mha1 = MHALayer(
+        name='mha_1',
+        Wq=Wq,
+        Wk=Wk,
+        Wv=Wv,
+        Wo=Wo,
+        num_heads=4,
+        d_model=ff_dim,
+        T=num_particles_pad,
+        softmax_bit=7,
+    )
     model.add_layer(mha1, inputs=[dense0])
     res1 = ResAddLayer(name='resadd_1')
     model.add_layer(res1, inputs=[mha1, dense0])
@@ -42,7 +52,17 @@ def build_and_run(seed: int = 0):
     res2 = ResAddLayer(name='resadd_2')
     model.add_layer(res2, inputs=[ff1b, res1])
 
-    mha2 = MHALayer(name='mha_2', Wq=Wq, Wk=Wk, Wv=Wv, Wo=Wo, num_heads=4, d_model=ff_dim, T=num_particles_pad)
+    mha2 = MHALayer(
+        name='mha_2',
+        Wq=Wq,
+        Wk=Wk,
+        Wv=Wv,
+        Wo=Wo,
+        num_heads=4,
+        d_model=ff_dim,
+        T=num_particles_pad,
+        softmax_bit=7,
+    )
     model.add_layer(mha2, inputs=[res2])
 
     res3 = ResAddLayer(name='resadd_3')
