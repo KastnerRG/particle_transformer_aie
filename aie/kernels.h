@@ -49,7 +49,7 @@ void dense(
 
 // (Q @ K^T):  (T, d_model) @ (T, d_model)^T -> (T, T)
 // m=4, k=8, n=8, T=160, d_model=64, Tm(rows)=160/m=40, Tn(columns)=64/n=8
-template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int B, int SOFTMAX_BIT>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int B>
 void scores(
   input_stream_int8 * __restrict sQ, // adf::input_buffer<int8, adf::extents<T*d_model>> & sQ,
   input_stream_int8 * __restrict sK, // adf::input_buffer<int8, adf::extents<T*d_model>> & sK,
@@ -66,7 +66,7 @@ void scores(
   // IntSoftmax polynomial parameters (aligned with NumPy golden path).
   // softmax scaling factor: s = 2^-B
   constexpr int N_EXP = 30;
-  static_assert(SOFTMAX_BIT > 0 && SOFTMAX_BIT <= 7, "SOFTMAX_BIT must be in [1, 7] for signed int8 stream");
+  constexpr int SOFTMAX_BIT = 7;
   const int b_eff = (B < 0) ? 0 : ((B > 18) ? 18 : B);
   const int64 scale_mul = (int64)1 << b_eff; // 2^B
 
@@ -309,6 +309,131 @@ void output(
       VC v = C.template to_vector<int8>(SHIFT_O);
       v = aie::max(v, (int8)0);
       writeincr(sO, v);
+    }
+  }
+}
+
+// Dense followed by row-wise integer softmax.
+// (x @ W) -> int8 dense tiles, then softmax across each full output row.
+// The softmax bitwidth is fixed to 7 to match the golden NumPy path.
+template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT, int B>
+void dense_softmax(
+  input_stream_int8 * __restrict sA,
+  output_stream_int8 * __restrict sC,
+  const int8 matB []
+) {
+  using MMUL = aie::mmul<m, k, n, int8, int8>;
+  using VA   = aie::vector<int8, MMUL::size_A>;
+  using VB   = aie::vector<int8, MMUL::size_B>;
+  using VC   = aie::vector<int8, MMUL::size_C>;
+  using VC32 = aie::vector<int32, MMUL::size_C>;
+  using VC8  = aie::vector<int8, MMUL::size_C>;
+
+  constexpr int SOFTMAX_BIT = 7;
+  constexpr int N_EXP = 30;
+
+  const int b_eff = (B < 0) ? 0 : ((B > 18) ? 18 : B);
+  const int64 scale_mul = (int64)1 << b_eff;
+
+  const int64 x0_num = 6931LL * scale_mul;
+  const int X0_INT = -(int)((x0_num + 9999LL) / 10000LL);
+
+  const int64 b_num = 96963238LL * scale_mul;
+  const int B_INT = (int)(b_num / 35815147LL);
+
+  const int64 scale_mul_sq = scale_mul * scale_mul;
+  const int64 c_num = 100000000LL * scale_mul_sq;
+  const int C_INT = (int)(c_num / 35815147LL);
+
+  auto floor_div = [](int a, int b) -> int {
+    int q = a / b;
+    int r = a % b;
+    if ((r != 0) && ((r > 0) != (b > 0))) {
+      --q;
+    }
+    return q;
+  };
+
+  const int8* __restrict Bbase = (const int8*)matB;
+  const unsigned strideB_perK  = MMUL::size_B * Tn;
+  constexpr int ROW_COLS = Tn * n;
+
+  for (unsigned im = 0; im < Tm; ++im) {
+    VA Abuf[Tk];
+    for (unsigned ik = 0; ik < Tk; ++ik) {
+      Abuf[ik] = readincr_v<MMUL::size_A>(sA);
+    }
+
+    int32 row_scores[m][ROW_COLS];
+    int8 row_probs[m][ROW_COLS];
+
+    for (unsigned in = 0; in < Tn; ++in) {
+      MMUL C;
+      const int8* __restrict pB = Bbase + in * MMUL::size_B;
+
+      for (unsigned ik = 0; ik < Tk; ++ik) {
+        VB b = aie::load_v<MMUL::size_B>(pB + ik * strideB_perK);
+        if (ik == 0) C.mul(Abuf[0], b);
+        else         C.mac(Abuf[ik], b);
+      }
+
+      VC32 V = C.template to_vector<int32>(SHIFT);
+      const unsigned base_col = in * n;
+      for (unsigned r = 0; r < m; ++r) {
+        for (unsigned c = 0; c < n; ++c) {
+          row_scores[r][base_col + c] = V[r * n + c];
+        }
+      }
+    }
+
+    for (unsigned r = 0; r < m; ++r) {
+      int32 row_max = row_scores[r][0];
+      for (unsigned col = 1; col < ROW_COLS; ++col) {
+        if (row_scores[r][col] > row_max) row_max = row_scores[r][col];
+      }
+
+      int64 exp_vals[ROW_COLS];
+      int64 exp_sum = 0;
+
+      for (unsigned col = 0; col < ROW_COLS; ++col) {
+        int x = row_scores[r][col] - row_max;
+        const int min_x = N_EXP * X0_INT;
+        if (x < min_x) x = min_x;
+
+        const int q = floor_div(x, X0_INT);
+        const int rem = x - X0_INT * q;
+
+        int64 z = (int64)rem * (int64)(rem + B_INT) + (int64)C_INT;
+        int shift = N_EXP - q;
+        if (shift < 0) shift = 0;
+        if (shift > 62) shift = 62;
+
+        int64 exp_int = z << shift;
+        if (exp_int < 0) exp_int = 0;
+
+        exp_vals[col] = exp_int;
+        exp_sum += exp_int;
+      }
+
+      if (exp_sum <= 0) exp_sum = 1;
+      const uint64 factor = ((uint64)1 << 32) / (uint64)exp_sum;
+
+      for (unsigned col = 0; col < ROW_COLS; ++col) {
+        uint64 p = ((uint64)exp_vals[col] * factor) >> (32 - SOFTMAX_BIT);
+        if (p > 127) p = 127;
+        row_probs[r][col] = (int8)p;
+      }
+    }
+
+    for (unsigned in = 0; in < Tn; ++in) {
+      VC8 out;
+      const unsigned base_col = in * n;
+      for (unsigned r = 0; r < m; ++r) {
+        for (unsigned c = 0; c < n; ++c) {
+          out[r * n + c] = row_probs[r][base_col + c];
+        }
+      }
+      writeincr(sC, out);
     }
   }
 }

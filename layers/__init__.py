@@ -9,7 +9,8 @@ Each layer type is self-contained with:
 
 from .base import AIELayer
 from .dense import DenseLayer
+from .dense_softmax import DenseSoftmaxLayer
 from .mha import MHALayer
 from .resadd import ResAddLayer
 
-__all__ = ['AIELayer', 'DenseLayer', 'MHALayer', 'ResAddLayer']
+__all__ = ['AIELayer', 'DenseLayer', 'DenseSoftmaxLayer', 'MHALayer', 'ResAddLayer']

@@ -2,17 +2,19 @@
 import numpy as np
 
 
-def _int_softmax(scores_int, output_bit=7, scaling_factor=1.0):
+SOFTMAX_BIT = 7
+
+
+def _int_softmax(scores_int, scaling_factor=1.0):
     """
     Integer softmax approximation adapted from IntSoftmax.
 
     Args:
         scores_int: int32 array with shape (..., T)
-        output_bit: softmax output bitwidth (default 7)
         scaling_factor: scalar used by integer exp approximation.
 
     Returns:
-        probs_int: int32 array where each row approximately sums to 2**output_bit.
+        probs_int: int32 array where each row approximately sums to 2**SOFTMAX_BIT.
     """
     x = scores_int.astype(np.int64, copy=False)
 
@@ -45,7 +47,7 @@ def _int_softmax(scores_int, output_bit=7, scaling_factor=1.0):
     exp_sum = np.maximum(exp_sum, 1)
 
     factor = np.floor_divide(1 << 32, exp_sum)
-    probs_int = np.floor_divide(exp_int * factor, 1 << (32 - output_bit))
+    probs_int = np.floor_divide(exp_int * factor, 1 << (32 - SOFTMAX_BIT))
     return probs_int.astype(np.int32)
 
 def _choose_shift(acc_int32):
@@ -92,7 +94,6 @@ class NumpyMHALinear:
         Wk,
         Wv,
         Wo,
-        softmax_bit=7,
         softmax_scaling=None,
     ):
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -106,7 +107,6 @@ class NumpyMHALinear:
         self.Wk = Wk
         self.Wv = Wv
         self.Wo = Wo
-        self.softmax_bit = int(softmax_bit)
         self.softmax_scaling = None if softmax_scaling is None else float(softmax_scaling)
 
     def __call__(self, q, k=None, v=None, layers=None, training=False):
@@ -170,10 +170,9 @@ class NumpyMHALinear:
                 Kt = kh[b, h].astype(np.int32).T           # (dh,T)
                 scores_acc = Q @ Kt                         # (T,T) int32 //LAYER
 
-                # Integer softmax: takes int32 accumulation directly, outputs int8 scaled to 2^softmax_bit
+                # Integer softmax: takes int32 accumulation directly, outputs int8 scaled to 2^SOFTMAX_BIT
                 attn_int = _int_softmax(
                     scores_acc,
-                    output_bit=self.softmax_bit,
                     scaling_factor=softmax_scaling,
                 )
                 # Track softmax shift for reference (not used in quantization)
@@ -183,11 +182,11 @@ class NumpyMHALinear:
                 V = vh[b, h].astype(np.int32)               # (T,dh), promote for accum
                 ctx_acc = attn_int @ V                       # (T,dh) int32
 
-                # Undo softmax fixed-point scale (sum approximately equals 2**softmax_bit).
-                ctx_acc = ctx_acc >> self.softmax_bit
+                # Undo softmax fixed-point scale (sum approximately equals 2**SOFTMAX_BIT).
+                ctx_acc = ctx_acc >> SOFTMAX_BIT
 
                 sh_c = _choose_shift(ctx_acc)
-                sh_c_heads[h] = sh_c + self.softmax_bit
+                sh_c_heads[h] = sh_c + SOFTMAX_BIT
                 ctx_q = np.clip(ctx_acc >> sh_c, -128, 127).astype(np.int8)  # (T,dh)
 
                 ctx_h[b, h] = ctx_q

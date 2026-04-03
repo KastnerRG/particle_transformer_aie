@@ -17,7 +17,6 @@ class MHALayer(AIELayer):
         num_heads: int,
         d_model: int = 64,
         T: int = 160,
-        softmax_bit: int = 7,
     ):
         """
         Initialize MHA layer.
@@ -31,7 +30,6 @@ class MHALayer(AIELayer):
             num_heads: Number of attention heads (1 or 4)
             d_model: Model dimension
             T: Sequence length (padded)
-            softmax_bit: Softmax fixed-point output bitwidth (signed-int8 safe default: 7)
 
         Note: Tiling parameters (m, k, n) are set by AIEModel when layer is added.
         """
@@ -43,7 +41,6 @@ class MHALayer(AIELayer):
             'num_heads': num_heads,
             'd_model': d_model,
             'T': T,
-            'softmax_bit': softmax_bit,
         })
 
         self.Wq = Wq
@@ -53,7 +50,6 @@ class MHALayer(AIELayer):
         self.num_heads = num_heads
         self.d_model = d_model
         self.T = T
-        self.softmax_bit = int(softmax_bit)
         self.head_dim = d_model // num_heads
 
         self.m = None
@@ -97,7 +93,6 @@ class MHALayer(AIELayer):
             Wk=self.Wk,
             Wv=self.Wv,
             Wo=self.Wo,
-            softmax_bit=self.softmax_bit,
         )
 
         output = mha(x, x, x, layers=layers_list)
@@ -180,7 +175,7 @@ class MHALayer(AIELayer):
             with open(f"aie/layer_{self.idx}_scores_head{h}.cc", "w") as fs:
                 fs.write('#include "kernels.h"\n\n')
                 fs.write(f'void scores{self.idx}_head{h}(input_stream_int8 * __restrict q_head, input_stream_int8 * __restrict k_head, output_stream_int8 * __restrict o_head){{ ')
-                fs.write(f'scores<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.head_dim//self.k}, {self.head_dim//self.n}, {self.head_dim}, {self.T}, {self.shift_q + self.shift_k}, {self.softmax_bit}>')
+                fs.write(f'scores<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.head_dim//self.k}, {self.head_dim//self.n}, {self.head_dim}, {self.T}, {self.shift_q + self.shift_k}>')
                 fs.write('(q_head, k_head, o_head);}\n')
 
             with open(f"aie/layer_{self.idx}_context_head{h}.cc", "w") as fc:
@@ -354,4 +349,4 @@ class MHALayer(AIELayer):
         idx_str = f"idx={self.idx}" if self.idx is not None else "idx=unassigned"
         return (f"MHALayer({idx_str}, name='{self.name}', "
                 f"num_heads={self.num_heads}, d_model={self.d_model}, "
-            f"softmax_bit={self.softmax_bit}, num_kernels={self.num_kernels()})")
+                f"num_kernels={self.num_kernels()})")

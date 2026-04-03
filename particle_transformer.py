@@ -35,7 +35,6 @@ def build_and_run(seed: int = 0):
         num_heads=4,
         d_model=ff_dim,
         T=num_particles_pad,
-        softmax_bit=7,
     )
     model.add_layer(mha1, inputs=[dense0])
     res1 = ResAddLayer(name='resadd_1')
@@ -61,7 +60,6 @@ def build_and_run(seed: int = 0):
         num_heads=4,
         d_model=ff_dim,
         T=num_particles_pad,
-        softmax_bit=7,
     )
     model.add_layer(mha2, inputs=[res2])
 
