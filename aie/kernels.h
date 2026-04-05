@@ -7,7 +7,7 @@
 #include "aie_api/aie_adf.hpp"
 
 
-template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT, bool is_relu>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT, int SCALE, bool is_relu>
 void dense(
   input_stream_int8 * __restrict sA,
   output_stream_int8 * __restrict sC,
@@ -17,7 +17,6 @@ void dense(
   using VA   = aie::vector<int8, MMUL::size_A>;
   using VB   = aie::vector<int8, MMUL::size_B>;
   using VC   = aie::vector<int8, MMUL::size_C>;
-  int count = 0;
   
   const int8* __restrict Bbase = (const int8*)matB;
   const unsigned strideB_perK  = MMUL::size_B * Tn; // row length
@@ -38,18 +37,18 @@ void dense(
         if (ik == 0) C.mul(Abuf[0], b); // row 0
         else         C.mac(Abuf[ik], b); // row Tk
       }
-
-      VC v = C.template to_vector<int8>(SHIFT);
+      aie::vector<int32, MMUL::size_C> raw_v = C.template to_vector<int32>(0); // int32 since max val is int8 * int8 * ff_dim
+      auto scaled_v = aie::mul(raw_v, SCALE);
+      VC v = scaled_v.template to_vector<int8>(SHIFT);
       if (is_relu) v = aie::max(v, (int8)0);
       writeincr(sC, v);
-      count++;
     }
   }
 }
 
 // (Q @ K^T):  (T, d_model) @ (T, d_model)^T -> (T, T)
 // m=4, k=8, n=8, T=160, d_model=64, Tm(rows)=160/m=40, Tn(columns)=64/n=8
-template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int SHIFT_S>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int d_model, int T, int SHIFT_S, int SCALE>
 void scores(
   input_stream_int8 * __restrict sQ, // adf::input_buffer<int8, adf::extents<T*d_model>> & sQ,
   input_stream_int8 * __restrict sK, // adf::input_buffer<int8, adf::extents<T*d_model>> & sK,
@@ -80,8 +79,10 @@ void scores(
         if (in == 0) C.mul(Abuf[0], matB[jm*Tn+in]);
         else         C.mac(Abuf[in], matB[jm*Tn+in]);
       }
-      VC V = C.template to_vector<int8>(SHIFT_S);
-      writeincr(sS, V);
+      aie::vector<int32, MMUL::size_C> raw_v = C.template to_vector<int32>(0);
+      auto scaled_v = aie::mul(raw_v, SCALE);
+      VC v = scaled_v.template to_vector<int8>(SHIFT_S);
+      writeincr(sS, v);
     }
   }
 }
@@ -89,7 +90,7 @@ void scores(
 // (scores @ V)  (T,T) @ (T,d_model) -> (T,d_model) mxk
 // Tm = 160/4 = 40, Tk = 160/4 = 40, Tn = 64/8 = 8
 // 160 x 160 x 64 tiled with 4 x 4 x 8
-template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT, int SCALE>
 void context(
   input_stream_int8 * __restrict sS,
   input_stream_int8 * __restrict sV,
@@ -126,10 +127,10 @@ void context(
         if (jm == 0) C.mul(Abuf[0], matB[jm*Tn+in]);
         else         C.mac(Abuf[jm], matB[jm*Tn+in]);
       }
-
-      VC v = C.template to_vector<int16>(SHIFT);
-      VCout vout = v.pack();
-      writeincr(sC, vout);
+      aie::vector<int32, MMUL::size_C> raw_v = C.template to_vector<int32>(0);
+      auto scaled_v = aie::mul(raw_v, SCALE);
+      VCout v = scaled_v.template to_vector<int8>(SHIFT);
+      writeincr(sC, v);
     }
   }
 }
@@ -177,7 +178,7 @@ void resadd(
 }
 
 // (context @ Wo)  (T,d_model) @ (d_model,d_model) -> (T,d_model)
-template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT_O>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT_O, int SCALE>
 void output(
   input_stream_int8* __restrict sA,
   input_stream_int8* __restrict sB,
@@ -213,7 +214,9 @@ void output(
         else         C.mac(Abuf[ik], b);
       }
 
-      VC v = C.template to_vector<int8>(SHIFT_O);
+      aie::vector<int32, MMUL::size_C> raw_v = C.template to_vector<int32>(0);
+      auto scaled_v = aie::mul(raw_v, SCALE);
+      VC v = scaled_v.template to_vector<int8>(SHIFT_O);
       v = aie::max(v, (int8)0);
       writeincr(sO, v);
     }

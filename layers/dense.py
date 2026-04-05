@@ -3,6 +3,16 @@ from typing import List, Optional
 from .base import AIELayer
 from utils.tiling import tile_matrix
 
+def _choose_scale_and_shift(acc_int32, shift=15):
+    """
+    Calculate optimal scale and shift to map int32 accumulators to int8 range.
+    """
+    max_abs = int(np.max(np.abs(acc_int32))) if acc_int32.size else 0
+    if max_abs <= 127: 
+        return 1, 0
+    float_scale = 127.0 / max_abs
+    int_scale = int(np.round(float_scale * (1 << shift)))
+    return int_scale, shift
 
 class DenseLayer(AIELayer):
 
@@ -11,6 +21,7 @@ class DenseLayer(AIELayer):
         name: str,
         weight: np.ndarray,
         shift: int,
+        scale: int,
         relu: bool = False
     ):
         """
@@ -19,7 +30,8 @@ class DenseLayer(AIELayer):
         Args:
             name: Layer name
             weight: Weight matrix (int8), shape (in_features, out_features)
-            shift: Right shift for requantization
+            shift: Right shift for requantization (hardcoded from particle_transformer.py)
+            scale: Multiplier scale for requantization (hardcoded from particle_transformer.py)
             relu: Apply ReLU activation
 
         Note: Tiling parameters (m, k, n) are set by AIEModel when layer is added.
@@ -27,11 +39,13 @@ class DenseLayer(AIELayer):
         super().__init__(name, 'dense', params={
             'weight': weight,
             'shift': shift,
+            'scale': scale,
             'relu': relu
         })
 
         self.weight = weight
         self.shift = shift
+        self.scale = scale
         self.relu = relu
 
         self.m = None
@@ -57,7 +71,20 @@ class DenseLayer(AIELayer):
 
         y = np.matmul(x.astype(np.int32), self.weight.astype(np.int32))
 
-        y = (y >> self.shift).astype(np.int8)
+        best_scale, best_shift = _choose_scale_and_shift(y)
+        print(f"\n SCALE = {best_scale}, SHIFT = {best_shift}")
+
+
+        # use the optimal scale and shift values chosen by the golden model instead of passed in values
+        # ensures that future layers have correct input for choosing their own scale and shift values
+        # can remove these lines once printed scale and shift values are copied to particle_transformer.py
+        self.scale = best_scale
+        self.shift = best_shift
+
+
+        scaled_y = y.astype(np.int64) * self.scale
+        y = (scaled_y >> self.shift).astype(np.int32)
+        y = np.clip(y, -128, 127).astype(np.int8)
 
         if self.relu:
             a = np.maximum(0, y)
@@ -90,7 +117,7 @@ class DenseLayer(AIELayer):
 
         relu_str = 'true' if self.relu else 'false'
         f.write(f'void f{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-        f.write(f'dense<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {relu_str}>')
+        f.write(f'dense<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {self.scale}, {relu_str}>')
         f.write(' (x, a, k_p);}\n')
 
         self._generate_include_code()
@@ -120,4 +147,4 @@ class DenseLayer(AIELayer):
         act = 'ReLU' if self.relu else 'Linear'
         idx_str = f"idx={self.idx}" if self.idx is not None else "idx=unassigned"
         return (f"DenseLayer({idx_str}, name='{self.name}', "
-                f"weight={self.weight.shape}, shift={self.shift}, act={act})")
+                f"weight={self.weight.shape}, shift={self.shift}, scale={self.scale}, act={act})")

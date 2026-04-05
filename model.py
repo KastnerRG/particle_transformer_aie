@@ -287,6 +287,14 @@ class AIEModel:
         except subprocess.CalledProcessError as e:
             print(f"  ✗ Error during compilation/simulation: {e}")
             raise
+        except KeyboardInterrupt:
+            print("\n  ! Script interrupted.")
+            raise
+        finally:
+            user = os.environ.get("USER")
+            if user:
+                subprocess.run(["pkill", "-u", user, "-f", "v++"], stderr=subprocess.DEVNULL)
+                subprocess.run(["pkill", "-u", user, "-f", "aiesimulator"], stderr=subprocess.DEVNULL)
 
     def _validate_output(self) -> bool:
         """
