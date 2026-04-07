@@ -16,7 +16,9 @@ def _quantize_gemm(x_int8_2d, W_int8_2d, relu=False):
     acc = x_int8_2d.astype(np.int32) @ W_int8_2d.astype(np.int32)
     scale, shift = _choose_scale_and_shift(acc)
     scaled_acc = acc.astype(np.int64) * scale # Emulate the 64-bit accumulator during multiplication
-    y = (scaled_acc >> shift).astype(np.int32)
+    # scaled_acc_rounded = scaled_acc + (1 << (shift - 1)) # Add half of the divisor to emulate symmetric rounding
+    # y = (scaled_acc_rounded >> shift).astype(np.int32)
+    y = np.around(scaled_acc / (1 << shift)).astype(np.int32) # bankers rounding
     y = np.clip(y, -128, 127).astype(np.int8)
     if relu:
         y = np.maximum(y, 0)
@@ -114,7 +116,9 @@ class NumpyMHALinear:
                 sh_s_heads[h] = sh_s
                 
                 scores_scaled = scores_acc.astype(np.int64) * sc_s
-                scores_q = np.clip((scores_scaled >> sh_s), -128, 127).astype(np.int8)
+                # scores_scaled_rounded = scores_scaled + (1 << (sh_s - 1))
+                scores_scaled_rounded = np.around(scores_scaled / (1 << sh_s)).astype(np.int32) # bankers rounding
+                scores_q = np.clip(scores_scaled_rounded, -128, 127).astype(np.int8)
 
                 V = vh[b, h].astype(np.int32)               # (T,dh), promote for accum
                 ctx_acc = scores_q.astype(np.int32) @ V     # (T,dh) int32
@@ -125,7 +129,9 @@ class NumpyMHALinear:
                 sh_c_heads[h] = sh_c
                 
                 ctx_scaled = ctx_acc.astype(np.int64) * sc_c
-                ctx_q = np.clip((ctx_scaled >> sh_c), -128, 127).astype(np.int8)
+                # ctx_scaled_rounded = ctx_scaled + (1 << (sh_c - 1))
+                ctx_scaled_rounded = np.around(ctx_scaled / (1 << sh_c)).astype(np.int32) # bankers rounding
+                ctx_q = np.clip(ctx_scaled_rounded, -128, 127).astype(np.int8)
 
                 ctx_h[b, h] = ctx_q
 

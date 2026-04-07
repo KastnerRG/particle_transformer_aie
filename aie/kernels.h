@@ -13,6 +13,8 @@ void dense(
   output_stream_int8 * __restrict sC,
   const int8 matB []
   ) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+
   using MMUL = aie::mmul<m, k, n, int8, int8>; // m = 4, k = 8, n = 8
   using VA   = aie::vector<int8, MMUL::size_A>;
   using VB   = aie::vector<int8, MMUL::size_B>;
@@ -54,6 +56,8 @@ void scores(
   input_stream_int8 * __restrict sK, // adf::input_buffer<int8, adf::extents<T*d_model>> & sK,
   output_stream_int8 * __restrict sS
 ) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+
   using MMUL = aie::mmul<m, n, m, int8, int8>; // 4x8x4
   using VA   = aie::vector<int8, MMUL::size_A>; // 4x8
   using VB   = aie::vector<int8, MMUL::size_A>; // 8x4
@@ -96,6 +100,8 @@ void context(
   input_stream_int8 * __restrict sV,
   output_stream_int8 * __restrict sC
 ) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+
   using MMUL = aie::mmul<m, m, n, int8, int16>; // 4x4x8 -> 4x8
   using VA   = aie::vector<int8,  MMUL::size_A>; // 4x4 (int8)
   using VB   = aie::vector<int16, MMUL::size_B>; // 4x8 (int16)
@@ -185,6 +191,8 @@ void output(
   output_stream_int8* __restrict sO,
   const int8 Wo[]
 ) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
+
   using MMUL = aie::mmul<m, k, n, int8, int8>;
   using VA   = aie::vector<int8, MMUL::size_A>;
   using VB   = aie::vector<int8, MMUL::size_B>;

@@ -82,9 +82,10 @@ class DenseLayer(AIELayer):
         self.shift = best_shift
 
 
-        scaled_y = y.astype(np.int64) * self.scale
-        y = (scaled_y >> self.shift).astype(np.int32)
-        y = np.clip(y, -128, 127).astype(np.int8)
+        y_scaled = y.astype(np.int64) * self.scale
+        # y_scaled_rounded = y_scaled + (1 << (self.shift - 1)) # Add half of the divisor to emulate symmetric rounding
+        y_scaled_rounded = np.around(y_scaled / (1 << self.shift)).astype(np.int32)
+        y = np.clip(y_scaled_rounded, -128, 127).astype(np.int8)
 
         if self.relu:
             a = np.maximum(0, y)

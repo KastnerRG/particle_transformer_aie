@@ -43,46 +43,46 @@ def build_and_run(seed: int = 0):
     ff1a = DenseLayer(name='ff1a', weight=W_ff1a, shift=15, scale=42, relu=True)
     model.add_layer(ff1a, inputs=[res1])
 
-    W_ff1b = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    ff1b = DenseLayer(name='ff1b', weight=W_ff1b, shift=15, scale=91, relu=True)
-    model.add_layer(ff1b, inputs=[ff1a])
+    # W_ff1b = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    # ff1b = DenseLayer(name='ff1b', weight=W_ff1b, shift=15, scale=91, relu=True)
+    # model.add_layer(ff1b, inputs=[ff1a])
 
-    res2 = ResAddLayer(name='resadd_2')
-    model.add_layer(res2, inputs=[ff1b, res1])
+    # res2 = ResAddLayer(name='resadd_2')
+    # model.add_layer(res2, inputs=[ff1b, res1])
 
-    mha2 = MHALayer(
-        name='mha_2', Wq=Wq, Wk=Wk, Wv=Wv, Wo=Wo, num_heads=4, d_model=ff_dim, T=num_particles_pad,
-        scale_q=47, shift_q=15,
-        scale_k=36, shift_k=15,
-        scale_v=35, shift_v=15,
-        scale_s=[229, 452, 252, 281], shift_s=[15, 15, 15, 15],
-        scale_c=[9, 11, 16, 10], shift_c=[15, 15, 15, 15],
-        scale_o=53, shift_o=15
-    )
-    model.add_layer(mha2, inputs=[res2])
+    # mha2 = MHALayer(
+    #     name='mha_2', Wq=Wq, Wk=Wk, Wv=Wv, Wo=Wo, num_heads=4, d_model=ff_dim, T=num_particles_pad,
+    #     scale_q=47, shift_q=15,
+    #     scale_k=36, shift_k=15,
+    #     scale_v=35, shift_v=15,
+    #     scale_s=[229, 452, 252, 281], shift_s=[15, 15, 15, 15],
+    #     scale_c=[9, 11, 16, 10], shift_c=[15, 15, 15, 15],
+    #     scale_o=53, shift_o=15
+    # )
+    # model.add_layer(mha2, inputs=[res2])
 
-    res3 = ResAddLayer(name='resadd_3')
-    model.add_layer(res3, inputs=[mha2, res2])
+    # res3 = ResAddLayer(name='resadd_3')
+    # model.add_layer(res3, inputs=[mha2, res2])
 
-    W_ff2a = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    ff2a = DenseLayer(name='ff2a', weight=W_ff2a, shift=15, scale=31, relu=True)
-    model.add_layer(ff2a, inputs=[res3])
+    # W_ff2a = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    # ff2a = DenseLayer(name='ff2a', weight=W_ff2a, shift=15, scale=31, relu=True)
+    # model.add_layer(ff2a, inputs=[res3])
 
-    W_ff2b = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    ff2b = DenseLayer(name='ff2b', weight=W_ff2b, shift=15, scale=75, relu=True)
-    model.add_layer(ff2b, inputs=[ff2a])
+    # W_ff2b = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    # ff2b = DenseLayer(name='ff2b', weight=W_ff2b, shift=15, scale=75, relu=True)
+    # model.add_layer(ff2b, inputs=[ff2a])
 
-    res4 = ResAddLayer(name='resadd_4')
-    model.add_layer(res4, inputs=[ff2b, res3])
+    # res4 = ResAddLayer(name='resadd_4')
+    # model.add_layer(res4, inputs=[ff2b, res3])
 
-    W_out1 = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    out1 = DenseLayer(name='out1', weight=W_out1, shift=15, scale=30, relu=True)
-    model.add_layer(out1, inputs=[res4])
+    # W_out1 = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
+    # out1 = DenseLayer(name='out1', weight=W_out1, shift=15, scale=30, relu=True)
+    # model.add_layer(out1, inputs=[res4])
 
-    out_dim = 8
-    W_out2 = rng.integers(-128, 128, size=(ff_dim, out_dim), dtype=np.int8)
-    out2 = DenseLayer(name='out2', weight=W_out2, shift=15, scale=106, relu=False)
-    model.add_layer(out2, inputs=[out1])
+    # out_dim = 8
+    # W_out2 = rng.integers(-128, 128, size=(ff_dim, out_dim), dtype=np.int8)
+    # out2 = DenseLayer(name='out2', weight=W_out2, shift=15, scale=106, relu=False)
+    # model.add_layer(out2, inputs=[out1])
 
     y = model.forward(pad_inp)
     print(f"\nModel completed. Output shape: {y.shape}")
