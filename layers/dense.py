@@ -4,13 +4,23 @@ from .base import AIELayer
 from utils.tiling import tile_matrix
 
 
+def _choose_scale_and_shift(acc_int32, shift=15):
+    max_abs = int(np.max(np.abs(acc_int32))) if acc_int32.size else 0
+    if max_abs <= 127:
+        return 1, 0
+    float_scale = 127.0 / max_abs
+    int_scale = int(np.round(float_scale * (1 << shift)))
+    return int_scale, shift
+
+
 class DenseLayer(AIELayer):
 
     def __init__(
         self,
         name: str,
         weight: np.ndarray,
-        shift: int,
+        shift: Optional[int] = None,
+        scale: Optional[int] = None,
         relu: bool = False
     ):
         """
@@ -19,7 +29,8 @@ class DenseLayer(AIELayer):
         Args:
             name: Layer name
             weight: Weight matrix (int8), shape (in_features, out_features)
-            shift: Right shift for requantization
+            shift: Right shift for requantization. If None with scale None, infer dynamically.
+            scale: Multiplier scale for requantization. If None with shift None, infer dynamically.
             relu: Apply ReLU activation
 
         Note: Tiling parameters (m, k, n) are set by AIEModel when layer is added.
@@ -27,12 +38,15 @@ class DenseLayer(AIELayer):
         super().__init__(name, 'dense', params={
             'weight': weight,
             'shift': shift,
+            'scale': scale,
             'relu': relu
         })
 
         self.weight = weight
         self.shift = shift
+        self.scale = scale
         self.relu = relu
+        self.dynamic_quant = False
 
         self.m = None
         self.k = None
@@ -57,7 +71,22 @@ class DenseLayer(AIELayer):
 
         y = np.matmul(x.astype(np.int32), self.weight.astype(np.int32))
 
-        y = (y >> self.shift).astype(np.int8)
+        if self.dynamic_quant:
+            best_scale, best_shift = _choose_scale_and_shift(y)
+            self.scale = best_scale
+            self.shift = best_shift
+            print(f"DenseLayer {self.name}: using dynamic quantization (choose_scale_and_shift)")
+        else:
+            if self.shift is None or self.scale is None:
+                raise ValueError(
+                    f"DenseLayer {self.name}: static quantization requires both scale and shift."
+                )
+            print(f"DenseLayer {self.name}: using static quantization (scale={self.scale}, shift={self.shift})")
+
+        assert self.scale is not None and self.shift is not None
+        y_scaled = y.astype(np.int64) * self.scale
+        y_scaled_rounded = np.around(y_scaled / (1 << self.shift)).astype(np.int32)
+        y = np.clip(y_scaled_rounded, -128, 127).astype(np.int8)
 
         if self.relu:
             a = np.maximum(0, y)
@@ -90,7 +119,7 @@ class DenseLayer(AIELayer):
 
         relu_str = 'true' if self.relu else 'false'
         f.write(f'void f{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-        f.write(f'dense<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {relu_str}>')
+        f.write(f'dense<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {self.scale}, {relu_str}>')
         f.write(' (x, a, k_p);}\n')
 
         self._generate_include_code()
@@ -120,4 +149,4 @@ class DenseLayer(AIELayer):
         act = 'ReLU' if self.relu else 'Linear'
         idx_str = f"idx={self.idx}" if self.idx is not None else "idx=unassigned"
         return (f"DenseLayer({idx_str}, name='{self.name}', "
-                f"weight={self.weight.shape}, shift={self.shift}, act={act})")
+            f"weight={self.weight.shape}, shift={self.shift}, scale={self.scale}, act={act})")

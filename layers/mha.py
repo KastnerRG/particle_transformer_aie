@@ -15,8 +15,21 @@ class MHALayer(AIELayer):
         Wv: np.ndarray,
         Wo: np.ndarray,
         num_heads: int,
+        scale_q: Optional[int] = None,
+        shift_q: Optional[int] = None,
+        scale_k: Optional[int] = None,
+        shift_k: Optional[int] = None,
+        scale_v: Optional[int] = None,
+        shift_v: Optional[int] = None,
+        scale_s: Optional[List[int]] = None,
+        shift_s: Optional[List[int]] = None,
+        scale_c: Optional[List[int]] = None,
+        shift_c: Optional[List[int]] = None,
+        scale_o: Optional[int] = None,
+        shift_o: Optional[int] = None,
         d_model: int = 64,
         T: int = 160,
+        enable_softmax: bool = True,
     ):
         """
         Initialize MHA layer.
@@ -28,8 +41,10 @@ class MHALayer(AIELayer):
             Wv: Value weight matrix (d_model, d_model), int8
             Wo: Output weight matrix (d_model, d_model), int8
             num_heads: Number of attention heads (1 or 4)
+            scale_*/shift_*: Requantization values. If omitted, inferred dynamically for testing.
             d_model: Model dimension
             T: Sequence length (padded)
+            enable_softmax: If False, skip score softmax and use raw quantized scores
 
         Note: Tiling parameters (m, k, n) are set by AIEModel when layer is added.
         """
@@ -41,6 +56,7 @@ class MHALayer(AIELayer):
             'num_heads': num_heads,
             'd_model': d_model,
             'T': T,
+            'enable_softmax': enable_softmax,
         })
 
         self.Wq = Wq
@@ -50,6 +66,7 @@ class MHALayer(AIELayer):
         self.num_heads = num_heads
         self.d_model = d_model
         self.T = T
+        self.enable_softmax = bool(enable_softmax)
         self.head_dim = d_model // num_heads
 
         self.m = None
@@ -63,12 +80,20 @@ class MHALayer(AIELayer):
         self.layer_k = None
         self.layer_v = None
         self.layer_o = None
-        self.shift_q = None
-        self.shift_k = None
-        self.shift_v = None
-        self.shift_s = None
-        self.shift_c = None
-        self.shift_o = None
+        self.scale_q = scale_q
+        self.shift_q = shift_q
+        self.scale_k = scale_k
+        self.shift_k = shift_k
+        self.scale_v = scale_v
+        self.shift_v = shift_v
+        self.scale_s = scale_s if scale_s is not None else [1 for _ in range(self.num_heads)]
+        self.shift_s = shift_s if shift_s is not None else [15 for _ in range(self.num_heads)]
+        self.scale_c = scale_c if scale_c is not None else [1 for _ in range(self.num_heads)]
+        self.shift_c = shift_c if shift_c is not None else [15 for _ in range(self.num_heads)]
+        self.scale_o = scale_o
+        self.shift_o = shift_o
+        self.dynamic_quant = False
+
         self.Wq_heads = []
         self.Wk_heads = []
         self.Wv_heads = []
@@ -93,6 +118,20 @@ class MHALayer(AIELayer):
             Wk=self.Wk,
             Wv=self.Wv,
             Wo=self.Wo,
+            enable_softmax=self.enable_softmax,
+            use_dynamic_quant=self.dynamic_quant,
+            scale_q=self.scale_q,
+            shift_q=self.shift_q,
+            scale_k=self.scale_k,
+            shift_k=self.shift_k,
+            scale_v=self.scale_v,
+            shift_v=self.shift_v,
+            scale_s=self.scale_s,
+            shift_s=self.shift_s,
+            scale_c=self.scale_c,
+            shift_c=self.shift_c,
+            scale_o=self.scale_o,
+            shift_o=self.shift_o,
         )
 
         output = mha(x, x, x, layers=layers_list)
@@ -102,11 +141,17 @@ class MHALayer(AIELayer):
         self.layer_k = layers_list[1]
         self.layer_v = layers_list[2]
         self.layer_o = layers_list[3]
+        self.scale_q = self.layer_q['scale']
         self.shift_q = self.layer_q['shift']
+        self.scale_k = self.layer_k['scale']
         self.shift_k = self.layer_k['shift']
+        self.scale_v = self.layer_v['scale']
         self.shift_v = self.layer_v['shift']
-        self.shift_s = self.layer_q['shift_scores']  # Per-head list
-        self.shift_c = self.layer_q['shift_context']  # Per-head list
+        self.scale_s = self.layer_q['scale_scores']
+        self.shift_s = self.layer_q['shift_scores']
+        self.scale_c = self.layer_q['scale_context']
+        self.shift_c = self.layer_q['shift_context']
+        self.scale_o = self.layer_o['scale']
         self.shift_o = self.layer_o['shift']
 
         # Split and tile weight matrices per head
@@ -149,7 +194,7 @@ class MHALayer(AIELayer):
                 fq.write(' };\n\n')
                 fq.write('#include "kernels.h"\n\n')
                 fq.write(f'void q{self.idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-                fq.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_q}, false>')
+                fq.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_q}, {self.scale_q}, false>')
                 fq.write('(x, a, k_p);}\n')
 
             with open(f"aie/layer_{self.idx}_k_head{h}.cc", "w") as fk:
@@ -159,7 +204,7 @@ class MHALayer(AIELayer):
                 fk.write(' };\n\n')
                 fk.write('#include "kernels.h"\n\n')
                 fk.write(f'void k{self.idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-                fk.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_k}, false>')
+                fk.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_k}, {self.scale_k}, false>')
                 fk.write('(x, a, k_p);}\n')
 
             with open(f"aie/layer_{self.idx}_v_head{h}.cc", "w") as fv:
@@ -169,19 +214,22 @@ class MHALayer(AIELayer):
                 fv.write(' };\n\n')
                 fv.write('#include "kernels.h"\n\n')
                 fv.write(f'void v{self.idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-                fv.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_v}, false>')
+                fv.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_v}, {self.scale_v}, false>')
                 fv.write('(x, a, k_p);}\n')
 
             with open(f"aie/layer_{self.idx}_scores_head{h}.cc", "w") as fs:
                 fs.write('#include "kernels.h"\n\n')
                 fs.write(f'void scores{self.idx}_head{h}(input_stream_int8 * __restrict q_head, input_stream_int8 * __restrict k_head, output_stream_int8 * __restrict o_head){{ ')
-                fs.write(f'scores<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.head_dim//self.k}, {self.head_dim//self.n}, {self.head_dim}, {self.T}, {self.shift_q + self.shift_k}>')
+                if self.enable_softmax:
+                    fs.write(f'scores<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.head_dim//self.k}, {self.head_dim//self.n}, {self.head_dim}, {self.T}, {self.shift_q + self.shift_k}, {self.scale_q * self.scale_k}, 0, 1, true>')
+                else:
+                    fs.write(f'scores<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.head_dim//self.k}, {self.head_dim//self.n}, {self.head_dim}, {self.T}, {self.shift_q + self.shift_k}, {self.scale_q * self.scale_k}, {self.shift_s[h]}, {self.scale_s[h]}, false>')
                 fs.write('(q_head, k_head, o_head);}\n')
 
             with open(f"aie/layer_{self.idx}_context_head{h}.cc", "w") as fc:
                 fc.write('#include "kernels.h"\n\n')
                 fc.write(f'void context{self.idx}_head{h}(input_stream_int8 * __restrict x, input_stream_int8 * __restrict v, output_stream_int8 * __restrict a){{ ')
-                fc.write(f'context<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.T//self.k}, {self.head_dim//self.n}, {self.shift_c[h]}>')
+                fc.write(f'context<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.T//self.k}, {self.head_dim//self.n}, {self.shift_c[h]}, {self.scale_c[h]}>')
                 fc.write('(x, v, a);}\n')
 
         # Generate concat and output kernels
@@ -204,7 +252,7 @@ class MHALayer(AIELayer):
                 fo.write(' };\n\n')
                 fo.write('#include "kernels.h"\n\n')
                 fo.write(f'void out{self.idx}(input_stream_int8 * __restrict sA, input_stream_int8 * __restrict sB, output_stream_int8 * __restrict a){{')
-                fo.write(f'output<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.d_model//self.n}, {self.shift_o}>')
+                fo.write(f'output<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.d_model//self.n}, {self.shift_o}, {self.scale_o}>')
                 fo.write('(sA, sB, a, k_p);}\n')
 
         elif self.num_heads == 1:
@@ -215,7 +263,7 @@ class MHALayer(AIELayer):
                 fo.write(' };\n\n')
                 fo.write('#include "kernels.h"\n\n')
                 fo.write(f'void out{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-                fo.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_o}, true>')
+                fo.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_o}, {self.scale_o}, true>')
                 fo.write('(x, a, k_p);}\n')
 
         self._generate_include_code()

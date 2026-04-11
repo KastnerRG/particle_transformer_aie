@@ -11,8 +11,8 @@ class DenseSoftmaxLayer(AIELayer):
         self,
         name: str,
         weight: np.ndarray,
-        shift: int,
-        B: Optional[int] = None,
+        shift_in: int,
+        scale_in: int = 1,
     ):
         """
         Initialize dense+softmax layer.
@@ -20,20 +20,20 @@ class DenseSoftmaxLayer(AIELayer):
         Args:
             name: Layer name
             weight: Weight matrix (int8), shape (in_features, out_features)
-            shift: Right shift for requantization before softmax
-            B: Softmax input scale exponent; defaults to shift if omitted
+            shift_in: Softmax scaling shift. Effective scale is scale_in / 2^shift_in.
+            scale_in: Softmax scaling numerator. Effective scale is scale_in / 2^shift_in.
 
         Note: Tiling parameters (m, k, n) are set by AIEModel when layer is added.
         """
         super().__init__(name, 'dense_softmax', params={
             'weight': weight,
-            'shift': shift,
-            'B': shift if B is None else int(B),
+            'shift_in': int(shift_in),
+            'scale_in': int(scale_in),
         })
 
         self.weight = weight
-        self.shift = int(shift)
-        self.B = self.shift if B is None else int(B)
+        self.shift_in = int(shift_in)
+        self.scale_in = int(scale_in)
 
         self.m = None
         self.k = None
@@ -57,9 +57,8 @@ class DenseSoftmaxLayer(AIELayer):
             f"Batch dimension {x.shape[0]} must be divisible by m={self.m}"
 
         y = np.matmul(x.astype(np.int32), self.weight.astype(np.int32))
-        y = (y >> self.shift).astype(np.int32)
 
-        softmax_scale = np.ldexp(1.0, -self.B)
+        softmax_scale = np.ldexp(float(self.scale_in), -self.shift_in)
         probs_int = _int_softmax(y, scaling_factor=softmax_scale)
         a = np.clip(probs_int, -128, 127).astype(np.int8)
 
@@ -89,7 +88,7 @@ class DenseSoftmaxLayer(AIELayer):
         f.write('#include "kernels.h"\n\n')
 
         f.write(f'void f{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-        f.write(f'dense_softmax<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {self.B}>')
+        f.write(f'dense_softmax<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift_in}, {self.scale_in}>')
         f.write(' (x, a, k_p);}\n')
 
         self._generate_include_code()
@@ -117,4 +116,4 @@ class DenseSoftmaxLayer(AIELayer):
         """String representation for debugging."""
         idx_str = f"idx={self.idx}" if self.idx is not None else "idx=unassigned"
         return (f"DenseSoftmaxLayer({idx_str}, name='{self.name}', "
-                f"weight={self.weight.shape}, shift={self.shift}, B={self.B})")
+            f"weight={self.weight.shape}, shift_in={self.shift_in}, scale_in={self.scale_in})")

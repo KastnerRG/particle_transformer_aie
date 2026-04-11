@@ -3,7 +3,7 @@ from model import AIEModel
 from layers import DenseLayer, MHALayer, ResAddLayer
 
 
-def build_and_run(seed: int = 0):
+def build_and_run(seed: int = 0, enable_softmax: bool = True, use_dynamic_quant: bool = False):
     rng = np.random.default_rng(seed)
 
     in_particles, num_feature, ff_dim = 150, 3, 64
@@ -15,10 +15,10 @@ def build_and_run(seed: int = 0):
     pad_inp[:in_particles, :num_feature] = dummy_inp
 
     m, k, n = 4, 8, 8
-    model = AIEModel(m=m, k=k, n=n, iterations=1)
+    model = AIEModel(m=m, k=k, n=n, iterations=1, dynamic_quant=use_dynamic_quant)
 
     W_fc0 = rng.integers(-128, 128, size=(num_feature_pad, ff_dim), dtype=np.int8)
-    dense0 = DenseLayer(name='dense_0', weight=W_fc0, shift=2, relu=True)
+    dense0 = DenseLayer(name='dense_0', weight=W_fc0, shift=15, scale=115, relu=True)
     model.add_layer(dense0, inputs=[None])  # connect to AIE_IN under the hood
 
     Wq = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
@@ -33,19 +33,32 @@ def build_and_run(seed: int = 0):
         Wv=Wv,
         Wo=Wo,
         num_heads=4,
+        scale_q=76,
+        shift_q=15,
+        scale_k=55,
+        shift_k=15,
+        scale_v=61,
+        shift_v=15,
+        scale_s=[237, 229, 188, 198],
+        shift_s=[15, 15, 15, 15],
+        scale_c=[21, 22, 17, 18],
+        shift_c=[15, 15, 15, 15],
+        scale_o=44,
+        shift_o=15,
         d_model=ff_dim,
         T=num_particles_pad,
+        enable_softmax=enable_softmax,
     )
     model.add_layer(mha1, inputs=[dense0])
     res1 = ResAddLayer(name='resadd_1')
     model.add_layer(res1, inputs=[mha1, dense0])
 
     W_ff1a = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    ff1a = DenseLayer(name='ff1a', weight=W_ff1a, shift=3, relu=True)
+    ff1a = DenseLayer(name='ff1a', weight=W_ff1a, shift=15, scale=42, relu=True)
     model.add_layer(ff1a, inputs=[res1])
 
     W_ff1b = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    ff1b = DenseLayer(name='ff1b', weight=W_ff1b, shift=3, relu=True)
+    ff1b = DenseLayer(name='ff1b', weight=W_ff1b, shift=15, scale=91, relu=True)
     model.add_layer(ff1b, inputs=[ff1a])
 
     res2 = ResAddLayer(name='resadd_2')
@@ -58,8 +71,21 @@ def build_and_run(seed: int = 0):
         Wv=Wv,
         Wo=Wo,
         num_heads=4,
+        scale_q=47,
+        shift_q=15,
+        scale_k=36,
+        shift_k=15,
+        scale_v=35,
+        shift_v=15,
+        scale_s=[229, 452, 252, 281],
+        shift_s=[15, 15, 15, 15],
+        scale_c=[9, 11, 16, 10],
+        shift_c=[15, 15, 15, 15],
+        scale_o=53,
+        shift_o=15,
         d_model=ff_dim,
         T=num_particles_pad,
+        enable_softmax=enable_softmax,
     )
     model.add_layer(mha2, inputs=[res2])
 
@@ -67,23 +93,23 @@ def build_and_run(seed: int = 0):
     model.add_layer(res3, inputs=[mha2, res2])
 
     W_ff2a = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    ff2a = DenseLayer(name='ff2a', weight=W_ff2a, shift=3, relu=True)
+    ff2a = DenseLayer(name='ff2a', weight=W_ff2a, shift=15, scale=31, relu=True)
     model.add_layer(ff2a, inputs=[res3])
 
     W_ff2b = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    ff2b = DenseLayer(name='ff2b', weight=W_ff2b, shift=3, relu=True)
+    ff2b = DenseLayer(name='ff2b', weight=W_ff2b, shift=15, scale=75, relu=True)
     model.add_layer(ff2b, inputs=[ff2a])
 
     res4 = ResAddLayer(name='resadd_4')
     model.add_layer(res4, inputs=[ff2b, res3])
 
     W_out1 = rng.integers(-128, 128, size=(ff_dim, ff_dim), dtype=np.int8)
-    out1 = DenseLayer(name='out1', weight=W_out1, shift=3, relu=True)
+    out1 = DenseLayer(name='out1', weight=W_out1, shift=15, scale=30, relu=True)
     model.add_layer(out1, inputs=[res4])
 
     out_dim = 8
     W_out2 = rng.integers(-128, 128, size=(ff_dim, out_dim), dtype=np.int8)
-    out2 = DenseLayer(name='out2', weight=W_out2, shift=3, relu=False)
+    out2 = DenseLayer(name='out2', weight=W_out2, shift=15, scale=106, relu=False)
     model.add_layer(out2, inputs=[out1])
 
     y = model.forward(pad_inp)
@@ -92,4 +118,4 @@ def build_and_run(seed: int = 0):
 
 
 if __name__ == "__main__":
-    build_and_run()
+    build_and_run(enable_softmax = False)

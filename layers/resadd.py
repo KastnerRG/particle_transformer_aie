@@ -8,7 +8,8 @@ class ResAddLayer(AIELayer):
     def __init__(
         self,
         name: str,
-        shift: int = 0
+        shift: int = 0,
+        scale: int = 1
     ):
         """
         Initialize residual addition layer.
@@ -16,14 +17,17 @@ class ResAddLayer(AIELayer):
         Args:
             name: Layer name
             shift: Right shift for requantization (default: 0 for no shift)
+            scale: Multiply scale for requantization (default: 1 for no scale)
 
         Note: Tiling parameters (m, k, n) are set by AIEModel when layer is added.
         """
         super().__init__(name, 'resadd', params={
-            'shift': shift
+            'shift': shift,
+            'scale': scale
         })
-        # Note: SHIFT is currently not supported in the AIE resadd kernel; kept for future use
+        # Note: SHIFT and SCALE are currently not supported in the AIE resadd kernel; kept for future use
         self.shift = shift
+        self.scale = scale
 
         self.m = None
         self.k = None
@@ -111,4 +115,4 @@ class ResAddLayer(AIELayer):
         """String representation for debugging."""
         idx_str = f"idx={self.idx}" if self.idx is not None else "idx=unassigned"
         return (f"ResAddLayer({idx_str}, name='{self.name}', "
-                f"shift={self.shift})")
+            f"shift={self.shift}, scale={self.scale})")

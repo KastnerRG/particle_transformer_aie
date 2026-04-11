@@ -13,12 +13,13 @@ def build_and_run(seed: int = 0):
     x = rng.integers(-128, 128, size=(batch, features), dtype=np.int8)
     w = rng.integers(-128, 128, size=(features, features), dtype=np.int8)
 
-    model = AIEModel(m=4, k=8, n=8, iterations=1)
+    model = AIEModel(m=4, k=8, n=8, iterations=1, dynamic_quant=False)
 
     dense_softmax = DenseSoftmaxLayer(
         name='dense_softmax_0',
         weight=w,
-        shift=3,
+        shift_in=3,
+        scale_in=1,
     )
     model.add_layer(dense_softmax, inputs=[None])
 

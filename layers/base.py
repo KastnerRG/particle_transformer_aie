@@ -89,7 +89,7 @@ class AIELayer(ABC):
             f.write('#include "kernels.h"\\n\\n')
             f.write('alignas(32) int8 weights[...] = {...};\\n')
             f.write('void f0(input_stream<int16>* in, output_stream<int16>* out) {\\n')
-            f.write('    dense<...>(in, out, weights, shift);\\n')
+            f.write('    dense<...>(in, out, weights, shift, scale);\\n')
             f.write('}\\n')
         """
         pass

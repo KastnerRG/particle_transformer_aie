@@ -23,11 +23,12 @@ class AIEModel:
     Main model class for AIE neural network execution.
     """
 
-    def __init__(self, m: int = 4, k: int = 8, n: int = 8, iterations: int = 1):
+    def __init__(self, m: int = 4, k: int = 8, n: int = 8, iterations: int = 1, dynamic_quant: bool = False):
         self.m = m
         self.k = k
         self.n = n
         self.iterations = iterations
+        self.dynamic_quant = bool(dynamic_quant)
 
         self.layers: List[Any] = []  # Ordered list of layers
         self.input_map: Dict[Any, List[Tuple[Any, int]]] = {}  # layer -> [(src_layer, port), ...]
@@ -58,6 +59,7 @@ class AIEModel:
         layer.m = self.m
         layer.k = self.k
         layer.n = self.n
+        layer.dynamic_quant = self.dynamic_quant
 
         self.layers.append(layer)
 
@@ -74,6 +76,70 @@ class AIEModel:
         self.input_map[layer] = input_tuples
 
         return layer
+
+    def _layer_static_quant_params(self, layer) -> Dict[str, Any]:
+        if getattr(layer, 'layer_type', None) == 'dense':
+            return {'shift': getattr(layer, 'shift', None), 'scale': getattr(layer, 'scale', None)}
+        if getattr(layer, 'layer_type', None) == 'mha':
+            return {
+                'scale_q': getattr(layer, 'scale_q', None),
+                'shift_q': getattr(layer, 'shift_q', None),
+                'scale_k': getattr(layer, 'scale_k', None),
+                'shift_k': getattr(layer, 'shift_k', None),
+                'scale_v': getattr(layer, 'scale_v', None),
+                'shift_v': getattr(layer, 'shift_v', None),
+                'scale_s': getattr(layer, 'scale_s', None),
+                'shift_s': getattr(layer, 'shift_s', None),
+                'scale_c': getattr(layer, 'scale_c', None),
+                'shift_c': getattr(layer, 'shift_c', None),
+                'scale_o': getattr(layer, 'scale_o', None),
+                'shift_o': getattr(layer, 'shift_o', None),
+            }
+        return {}
+
+    def _validate_quantization_policy(self) -> None:
+        if self.dynamic_quant:
+            layers_with_static = []
+            for layer in self.layers:
+                params = self._layer_static_quant_params(layer)
+                if any(value is not None for value in params.values()):
+                    layers_with_static.append(layer.name)
+
+            print("  ! Model is dynamically quantized from the golden reference forward pass.")
+            if layers_with_static:
+                print("  ! Any user-defined static quantization factors will be ignored.")
+            return
+
+        missing_messages = []
+        for layer in self.layers:
+            if getattr(layer, 'layer_type', None) == 'dense':
+                if getattr(layer, 'shift', None) is None or getattr(layer, 'scale', None) is None:
+                    missing_messages.append(f"Dense layer '{layer.name}' requires both scale and shift in static mode.")
+            elif getattr(layer, 'layer_type', None) == 'mha':
+                required = {
+                    'scale_q': getattr(layer, 'scale_q', None),
+                    'shift_q': getattr(layer, 'shift_q', None),
+                    'scale_k': getattr(layer, 'scale_k', None),
+                    'shift_k': getattr(layer, 'shift_k', None),
+                    'scale_v': getattr(layer, 'scale_v', None),
+                    'shift_v': getattr(layer, 'shift_v', None),
+                    'scale_s': getattr(layer, 'scale_s', None),
+                    'shift_s': getattr(layer, 'shift_s', None),
+                    'scale_c': getattr(layer, 'scale_c', None),
+                    'shift_c': getattr(layer, 'shift_c', None),
+                    'scale_o': getattr(layer, 'scale_o', None),
+                    'shift_o': getattr(layer, 'shift_o', None),
+                }
+                missing = [name for name, value in required.items() if value is None]
+                if missing:
+                    missing_messages.append(
+                        f"MHA layer '{layer.name}' is missing static quantization factors: {', '.join(missing)}."
+                    )
+
+        if missing_messages:
+            raise ValueError("Static quantization mode requires all layer quantization factors.\n" + "\n".join(missing_messages))
+
+        print("  ! Model is using static quantization factors.")
 
     def forward(self, input_data: np.ndarray) -> np.ndarray:
         """
@@ -98,6 +164,9 @@ class AIEModel:
         print("=" * 60)
         print("AIE Model Forward Pass")
         print("=" * 60)
+
+        print("\n[0/6] Validating quantization policy...")
+        self._validate_quantization_policy()
 
         print("\n[1/6] Computing golden reference...")
         self._compute_golden()
