@@ -19,6 +19,7 @@ class DenseLayer(AIELayer):
         self,
         name: str,
         weight: np.ndarray,
+        bias: Optional[np.ndarray] = None,
         shift: Optional[int] = None,
         scale: Optional[int] = None,
         relu: bool = False
@@ -29,6 +30,7 @@ class DenseLayer(AIELayer):
         Args:
             name: Layer name
             weight: Weight matrix (int8), shape (in_features, out_features)
+            bias: Optional bias vector (int8), shape (out_features,).
             shift: Right shift for requantization. If None with scale None, infer dynamically.
             scale: Multiplier scale for requantization. If None with shift None, infer dynamically.
             relu: Apply ReLU activation
@@ -37,12 +39,23 @@ class DenseLayer(AIELayer):
         """
         super().__init__(name, 'dense', params={
             'weight': weight,
+            'bias': bias,
             'shift': shift,
             'scale': scale,
             'relu': relu
         })
 
         self.weight = weight
+        out_features = weight.shape[1]
+        if bias is None:
+            self.bias = None
+        else:
+            bias_arr = np.asarray(bias, dtype=np.int8)
+            if bias_arr.shape != (out_features,):
+                raise ValueError(
+                    f"DenseLayer {name}: bias shape must be ({out_features},), got {bias_arr.shape}"
+                )
+            self.bias = bias_arr
         self.shift = shift
         self.scale = scale
         self.relu = relu
@@ -69,10 +82,12 @@ class DenseLayer(AIELayer):
         assert x.shape[0] % self.m == 0, \
             f"Batch dimension {x.shape[0]} must be divisible by m={self.m}"
 
-        y = np.matmul(x.astype(np.int32), self.weight.astype(np.int32))
+        y_acc = np.matmul(x.astype(np.int32), self.weight.astype(np.int32))
+        if self.bias is not None:
+            y_acc = y_acc + self.bias.astype(np.int32)
 
         if self.dynamic_quant:
-            best_scale, best_shift = _choose_scale_and_shift(y)
+            best_scale, best_shift = _choose_scale_and_shift(y_acc)
             self.scale = best_scale
             self.shift = best_shift
             print(f"DenseLayer {self.name}: using dynamic quantization (choose_scale_and_shift)")
@@ -84,7 +99,7 @@ class DenseLayer(AIELayer):
             print(f"DenseLayer {self.name}: using static quantization (scale={self.scale}, shift={self.shift})")
 
         assert self.scale is not None and self.shift is not None
-        y_scaled = y.astype(np.int64) * self.scale
+        y_scaled = y_acc.astype(np.int64) * self.scale
         y_scaled_rounded = np.around(y_scaled / (1 << self.shift)).astype(np.int32)
         y = np.clip(y_scaled_rounded, -128, 127).astype(np.int8)
 
@@ -114,13 +129,22 @@ class DenseLayer(AIELayer):
         f.write(f'__attribute__((section(".data"))) alignas(32) int8_t k_p [{weight_tiled.size}] = {{ ')
         f.write(', '.join(str(int(x)) for x in weight_tiled))
         f.write(' };\n\n')
+        if self.bias is not None:
+            bias_flat = self.bias.reshape(-1)
+            f.write(f'__attribute__((section(".data"))) alignas(32) int8_t b_p [{bias_flat.size}] = {{ ')
+            f.write(', '.join(str(int(x)) for x in bias_flat))
+            f.write(' };\n\n')
 
         f.write('#include "kernels.h"\n\n')
 
         relu_str = 'true' if self.relu else 'false'
+        has_bias_str = 'true' if self.bias is not None else 'false'
         f.write(f'void f{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-        f.write(f'dense<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {self.scale}, {relu_str}>')
-        f.write(' (x, a, k_p);}\n')
+        f.write(f'dense<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift}, {self.scale}, {relu_str}, {has_bias_str}>')
+        if self.bias is not None:
+            f.write(' (x, a, k_p, b_p);}\n')
+        else:
+            f.write(' (x, a, k_p, nullptr);}\n')
 
         self._generate_include_code()
 
@@ -148,5 +172,6 @@ class DenseLayer(AIELayer):
         in_f, out_f = self.weight.shape
         act = 'ReLU' if self.relu else 'Linear'
         idx_str = f"idx={self.idx}" if self.idx is not None else "idx=unassigned"
+        bias_str = "None" if self.bias is None else str(self.bias.shape)
         return (f"DenseLayer({idx_str}, name='{self.name}', "
-            f"weight={self.weight.shape}, shift={self.shift}, scale={self.scale}, act={act})")
+            f"weight={self.weight.shape}, bias={bias_str}, shift={self.shift}, scale={self.scale}, act={act})")

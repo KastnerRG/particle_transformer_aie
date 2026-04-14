@@ -4,6 +4,13 @@ Input: 160x8 -> Hidden: 160x64 -> Output: 160x8
 """
 
 import numpy as np
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from model import AIEModel
 from layers import DenseLayer
 
@@ -13,9 +20,9 @@ def build_and_run(seed: int = 0):
 
     # Input parameters
     num_particles_pad = 160
-    input_dim = 8
+    input_dim = 64
     hidden_dim = 64
-    output_dim = 8
+    output_dim = 64
 
     # Create dummy input: (160, 8)
     dummy_inp = rng.integers(-128, 128, size=(num_particles_pad, input_dim), dtype=np.int8)
@@ -28,12 +35,14 @@ def build_and_run(seed: int = 0):
 
     # First dense layer: 8 -> 64
     W_fc1 = rng.integers(-128, 128, size=(input_dim, hidden_dim), dtype=np.int8)
-    fc1 = DenseLayer(name='fc1', weight=W_fc1, shift=15, scale=73, relu=True)
+    b_fc1 = rng.integers(-128, 128, size=(hidden_dim,), dtype=np.int8)
+    fc1 = DenseLayer(name='fc1', weight=W_fc1, bias=b_fc1, shift=15, scale=73, relu=True)
     model.add_layer(fc1, inputs=[None])  # connect to AIE_IN
 
     # Second dense layer: 64 -> 8
     W_fc2 = rng.integers(-128, 128, size=(hidden_dim, output_dim), dtype=np.int8)
-    fc2 = DenseLayer(name='fc2', weight=W_fc2, shift=15, scale=58, relu=False)
+    b_fc2 = rng.integers(-128, 128, size=(output_dim,), dtype=np.int8)
+    fc2 = DenseLayer(name='fc2', weight=W_fc2, bias=b_fc2, shift=15, scale=58, relu=False)
     model.add_layer(fc2, inputs=[fc1])
 
     # Forward pass

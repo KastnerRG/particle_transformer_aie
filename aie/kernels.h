@@ -7,11 +7,12 @@
 #include "aie_api/aie_adf.hpp"
 
 
-template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT, int SCALE, bool is_relu>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT, int SCALE, bool is_relu, bool has_bias>
 void dense(
   input_stream_int8 * __restrict sA,
   output_stream_int8 * __restrict sC,
-  const int8 matB []
+  const int8 matB [],
+  const int8 bias []
   ) {
   aie::set_rounding(aie::rounding_mode::conv_even);
   aie::set_saturation(aie::saturation_mode::saturate);
@@ -42,6 +43,14 @@ void dense(
       }
 
       aie::vector<int32, MMUL::size_C> raw_v = C.template to_vector<int32>(0);
+      if constexpr (has_bias) {
+        for (unsigned rr = 0; rr < m; ++rr) {
+          for (unsigned cc = 0; cc < n; ++cc) {
+            const int idx = rr * n + cc;
+            raw_v[idx] = raw_v[idx] + (int32)bias[in * n + cc];
+          }
+        }
+      }
       auto scaled_v = aie::mul(raw_v, SCALE);
       VC v = scaled_v.template to_vector<int8>(SHIFT);
       if (is_relu) v = aie::max(v, (int8)0);
@@ -297,12 +306,13 @@ void resadd(
 }
 
 // (context @ Wo)  (T,d_model) @ (d_model,d_model) -> (T,d_model)
-template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT_O, int SCALE>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT_O, int SCALE, bool has_bias>
 void output(
   input_stream_int8* __restrict sA,
   input_stream_int8* __restrict sB,
   output_stream_int8* __restrict sO,
-  const int8 Wo[]
+  const int8 Wo[],
+  const int8 bias[]
 ) {
   aie::set_rounding(aie::rounding_mode::conv_even);
   aie::set_saturation(aie::saturation_mode::saturate);
@@ -337,6 +347,14 @@ void output(
       }
 
       aie::vector<int32, MMUL::size_C> raw_v = C.template to_vector<int32>(0);
+      if constexpr (has_bias) {
+        for (unsigned rr = 0; rr < m; ++rr) {
+          for (unsigned cc = 0; cc < n; ++cc) {
+            const int idx = rr * n + cc;
+            raw_v[idx] = raw_v[idx] + (int32)bias[in * n + cc];
+          }
+        }
+      }
       auto scaled_v = aie::mul(raw_v, SCALE);
       VC v = scaled_v.template to_vector<int8>(SHIFT_O);
       v = aie::max(v, (int8)0);
@@ -348,11 +366,12 @@ void output(
 // Dense followed by row-wise integer softmax.
 // (x @ W) -> int8 dense tiles, then softmax across each full output row.
 // The softmax bitwidth is fixed to 7 to match the golden NumPy path.
-template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT_IN, int SCALE_IN>
+template <int m, int k, int n, int Tm, int Tk, int Tn, int SHIFT_IN, int SCALE_IN, bool has_bias>
 void dense_softmax(
   input_stream_int8 * __restrict sA,
   output_stream_int8 * __restrict sC,
-  const int8 matB []
+  const int8 matB [],
+  const int8 bias []
 ) {
   aie::set_rounding(aie::rounding_mode::conv_even);
   aie::set_saturation(aie::saturation_mode::saturate);
@@ -420,7 +439,11 @@ void dense_softmax(
       const unsigned base_col = in * n;
       for (unsigned r = 0; r < m; ++r) {
         for (unsigned c = 0; c < n; ++c) {
-          row_scores[r][base_col + c] = V[r * n + c];
+          int32 v = V[r * n + c];
+          if constexpr (has_bias) {
+            v += (int32)bias[base_col + c];
+          }
+          row_scores[r][base_col + c] = v;
         }
       }
     }

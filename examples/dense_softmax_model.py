@@ -1,4 +1,10 @@
 import numpy as np
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from model import AIEModel
 from layers import DenseSoftmaxLayer
@@ -12,12 +18,14 @@ def build_and_run(seed: int = 0):
 
     x = rng.integers(-128, 128, size=(batch, features), dtype=np.int8)
     w = rng.integers(-128, 128, size=(features, features), dtype=np.int8)
+    b = rng.integers(-128, 128, size=(features,), dtype=np.int8)
 
     model = AIEModel(m=4, k=8, n=8, iterations=1, dynamic_quant=False)
 
     dense_softmax = DenseSoftmaxLayer(
         name='dense_softmax_0',
         weight=w,
+        bias=b,
         shift_in=3,
         scale_in=1,
     )

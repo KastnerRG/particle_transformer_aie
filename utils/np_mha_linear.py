@@ -66,11 +66,18 @@ def _resolve_scale_shift(acc_int32, scale=None, shift=None):
         return _choose_scale_and_shift(acc_int32)
     return int(scale), int(shift)
 
-def _quantize_gemm(x_int8_2d, W_int8_2d, relu=False, scale=None, shift=None):
+def _quantize_gemm(x_int8_2d, W_int8_2d, relu=False, scale=None, shift=None, bias_int8_1d=None):
     """
     y = x @ W with int32 accum, then (acc * scale) >> shift and saturate to int8.
     """
     acc = x_int8_2d.astype(np.int32) @ W_int8_2d.astype(np.int32)
+    if bias_int8_1d is not None:
+        bias_arr = np.asarray(bias_int8_1d, dtype=np.int8)
+        if bias_arr.shape != (W_int8_2d.shape[1],):
+            raise ValueError(
+                f"Bias shape must be ({W_int8_2d.shape[1]},), got {bias_arr.shape}"
+            )
+        acc = acc + bias_arr.astype(np.int32)
     scale, shift = _resolve_scale_shift(acc, scale, shift)
     scaled_acc = acc.astype(np.int64) * scale
     y = np.around(scaled_acc / (1 << shift)).astype(np.int32)
@@ -97,6 +104,7 @@ class NumpyMHALinear:
         Wk,
         Wv,
         Wo,
+        Bo=None,
         softmax_scaling=None,
         enable_softmax=True,
         scale_q=None,
@@ -124,6 +132,7 @@ class NumpyMHALinear:
         self.Wk = Wk
         self.Wv = Wv
         self.Wo = Wo
+        self.Bo = None if Bo is None else np.asarray(Bo, dtype=np.int8)
         self.softmax_scaling = None if softmax_scaling is None else float(softmax_scaling)
         self.enable_softmax = bool(enable_softmax)
 
@@ -262,7 +271,14 @@ class NumpyMHALinear:
 
         # ----- Output linear (exportable) -----
         ctx2d = ctx.reshape(BT, C)  # int8
-        out_proj, sc_o, sh_o = _quantize_gemm(ctx2d, self.Wo, relu=True, scale=None if self._use_dynamic_quant else self.scale_o, shift=None if self._use_dynamic_quant else self.shift_o)
+        out_proj, sc_o, sh_o = _quantize_gemm(
+            ctx2d,
+            self.Wo,
+            relu=True,
+            scale=None if self._use_dynamic_quant else self.scale_o,
+            shift=None if self._use_dynamic_quant else self.shift_o,
+            bias_int8_1d=self.Bo,
+        )
 
         # for debug
         if layers is not None:

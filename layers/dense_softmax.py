@@ -12,6 +12,7 @@ class DenseSoftmaxLayer(AIELayer):
         name: str,
         weight: np.ndarray,
         shift_in: int,
+        bias: Optional[np.ndarray] = None,
         scale_in: int = 1,
     ):
         """
@@ -20,6 +21,7 @@ class DenseSoftmaxLayer(AIELayer):
         Args:
             name: Layer name
             weight: Weight matrix (int8), shape (in_features, out_features)
+            bias: Optional bias vector (int8), shape (out_features,).
             shift_in: Softmax scaling shift. Effective scale is scale_in / 2^shift_in.
             scale_in: Softmax scaling numerator. Effective scale is scale_in / 2^shift_in.
 
@@ -27,11 +29,22 @@ class DenseSoftmaxLayer(AIELayer):
         """
         super().__init__(name, 'dense_softmax', params={
             'weight': weight,
+            'bias': bias,
             'shift_in': int(shift_in),
             'scale_in': int(scale_in),
         })
 
         self.weight = weight
+        out_features = weight.shape[1]
+        if bias is None:
+            self.bias = None
+        else:
+            bias_arr = np.asarray(bias, dtype=np.int8)
+            if bias_arr.shape != (out_features,):
+                raise ValueError(
+                    f"DenseSoftmaxLayer {name}: bias shape must be ({out_features},), got {bias_arr.shape}"
+                )
+            self.bias = bias_arr
         self.shift_in = int(shift_in)
         self.scale_in = int(scale_in)
 
@@ -57,6 +70,8 @@ class DenseSoftmaxLayer(AIELayer):
             f"Batch dimension {x.shape[0]} must be divisible by m={self.m}"
 
         y = np.matmul(x.astype(np.int32), self.weight.astype(np.int32))
+        if self.bias is not None:
+            y = y + self.bias.astype(np.int32)
 
         softmax_scale = np.ldexp(float(self.scale_in), -self.shift_in)
         probs_int = _int_softmax(y, scaling_factor=softmax_scale)
@@ -84,12 +99,21 @@ class DenseSoftmaxLayer(AIELayer):
         f.write(f'__attribute__((section(".data"))) alignas(32) int8_t k_p [{weight_tiled.size}] = {{ ')
         f.write(', '.join(str(int(x)) for x in weight_tiled))
         f.write(' };\n\n')
+        if self.bias is not None:
+            bias_flat = self.bias.reshape(-1)
+            f.write(f'__attribute__((section(".data"))) alignas(32) int8_t b_p [{bias_flat.size}] = {{ ')
+            f.write(', '.join(str(int(x)) for x in bias_flat))
+            f.write(' };\n\n')
 
         f.write('#include "kernels.h"\n\n')
 
+        has_bias_str = 'true' if self.bias is not None else 'false'
         f.write(f'void f{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-        f.write(f'dense_softmax<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift_in}, {self.scale_in}>')
-        f.write(' (x, a, k_p);}\n')
+        f.write(f'dense_softmax<{self.m}, {self.k}, {self.n}, {t_m}, {t_k}, {t_n}, {self.shift_in}, {self.scale_in}, {has_bias_str}>')
+        if self.bias is not None:
+            f.write(' (x, a, k_p, b_p);}\n')
+        else:
+            f.write(' (x, a, k_p, nullptr);}\n')
 
         self._generate_include_code()
 
@@ -115,5 +139,6 @@ class DenseSoftmaxLayer(AIELayer):
     def __repr__(self) -> str:
         """String representation for debugging."""
         idx_str = f"idx={self.idx}" if self.idx is not None else "idx=unassigned"
+        bias_str = "None" if self.bias is None else str(self.bias.shape)
         return (f"DenseSoftmaxLayer({idx_str}, name='{self.name}', "
-            f"weight={self.weight.shape}, shift_in={self.shift_in}, scale_in={self.scale_in})")
+            f"weight={self.weight.shape}, bias={bias_str}, shift_in={self.shift_in}, scale_in={self.scale_in})")

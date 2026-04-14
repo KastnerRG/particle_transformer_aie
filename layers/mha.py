@@ -15,6 +15,7 @@ class MHALayer(AIELayer):
         Wv: np.ndarray,
         Wo: np.ndarray,
         num_heads: int,
+        Bo: Optional[np.ndarray] = None,
         scale_q: Optional[int] = None,
         shift_q: Optional[int] = None,
         scale_k: Optional[int] = None,
@@ -40,6 +41,7 @@ class MHALayer(AIELayer):
             Wk: Key weight matrix (d_model, d_model), int8
             Wv: Value weight matrix (d_model, d_model), int8
             Wo: Output weight matrix (d_model, d_model), int8
+            Bo: Optional output projection bias vector (d_model,), int8
             num_heads: Number of attention heads (1 or 4)
             scale_*/shift_*: Requantization values. If omitted, inferred dynamically for testing.
             d_model: Model dimension
@@ -53,6 +55,7 @@ class MHALayer(AIELayer):
             'Wk': Wk,
             'Wv': Wv,
             'Wo': Wo,
+            'Bo': Bo,
             'num_heads': num_heads,
             'd_model': d_model,
             'T': T,
@@ -63,6 +66,13 @@ class MHALayer(AIELayer):
         self.Wk = Wk
         self.Wv = Wv
         self.Wo = Wo
+        if Bo is None:
+            self.Bo = None
+        else:
+            Bo_arr = np.asarray(Bo, dtype=np.int8)
+            if Bo_arr.shape != (d_model,):
+                raise ValueError(f"Output bias shape must be ({d_model},), got {Bo_arr.shape}")
+            self.Bo = Bo_arr
         self.num_heads = num_heads
         self.d_model = d_model
         self.T = T
@@ -118,6 +128,7 @@ class MHALayer(AIELayer):
             Wk=self.Wk,
             Wv=self.Wv,
             Wo=self.Wo,
+            Bo=self.Bo,
             enable_softmax=self.enable_softmax,
             use_dynamic_quant=self.dynamic_quant,
             scale_q=self.scale_q,
@@ -194,8 +205,8 @@ class MHALayer(AIELayer):
                 fq.write(' };\n\n')
                 fq.write('#include "kernels.h"\n\n')
                 fq.write(f'void q{self.idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-                fq.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_q}, {self.scale_q}, false>')
-                fq.write('(x, a, k_p);}\n')
+                fq.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_q}, {self.scale_q}, false, false>')
+                fq.write('(x, a, k_p, nullptr);}\n')
 
             with open(f"aie/layer_{self.idx}_k_head{h}.cc", "w") as fk:
                 fk.write('#include <cstdint>\n')
@@ -204,8 +215,8 @@ class MHALayer(AIELayer):
                 fk.write(' };\n\n')
                 fk.write('#include "kernels.h"\n\n')
                 fk.write(f'void k{self.idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-                fk.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_k}, {self.scale_k}, false>')
-                fk.write('(x, a, k_p);}\n')
+                fk.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_k}, {self.scale_k}, false, false>')
+                fk.write('(x, a, k_p, nullptr);}\n')
 
             with open(f"aie/layer_{self.idx}_v_head{h}.cc", "w") as fv:
                 fv.write('#include <cstdint>\n')
@@ -214,8 +225,8 @@ class MHALayer(AIELayer):
                 fv.write(' };\n\n')
                 fv.write('#include "kernels.h"\n\n')
                 fv.write(f'void v{self.idx}_head{h}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-                fv.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_v}, {self.scale_v}, false>')
-                fv.write('(x, a, k_p);}\n')
+                fv.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_v}, {self.scale_v}, false, false>')
+                fv.write('(x, a, k_p, nullptr);}\n')
 
             with open(f"aie/layer_{self.idx}_scores_head{h}.cc", "w") as fs:
                 fs.write('#include "kernels.h"\n\n')
@@ -250,10 +261,18 @@ class MHALayer(AIELayer):
                 fo.write(f'__attribute__((section(".data"))) alignas(32) int8_t k_p [{self.Wo_tiled.size}] = {{ ')
                 fo.write(', '.join(str(int(x)) for x in self.Wo_tiled))
                 fo.write(' };\n\n')
+                if self.Bo is not None:
+                    fo.write(f'__attribute__((section(".data"))) alignas(32) int8_t b_p [{self.Bo.size}] = {{ ')
+                    fo.write(', '.join(str(int(x)) for x in self.Bo.reshape(-1)))
+                    fo.write(' };\n\n')
                 fo.write('#include "kernels.h"\n\n')
                 fo.write(f'void out{self.idx}(input_stream_int8 * __restrict sA, input_stream_int8 * __restrict sB, output_stream_int8 * __restrict a){{')
-                fo.write(f'output<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.d_model//self.n}, {self.shift_o}, {self.scale_o}>')
-                fo.write('(sA, sB, a, k_p);}\n')
+                has_bias_str = 'true' if self.Bo is not None else 'false'
+                fo.write(f'output<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.d_model//self.n}, {self.shift_o}, {self.scale_o}, {has_bias_str}>')
+                if self.Bo is not None:
+                    fo.write('(sA, sB, a, k_p, b_p);}\n')
+                else:
+                    fo.write('(sA, sB, a, k_p, nullptr);}\n')
 
         elif self.num_heads == 1:
             with open(f"aie/layer_{self.idx}_out.cc", "w") as fo:
@@ -261,10 +280,18 @@ class MHALayer(AIELayer):
                 fo.write(f'__attribute__((section(".data"))) alignas(32) int8_t k_p [{self.Wo_tiled.size}] = {{ ')
                 fo.write(', '.join(str(int(x)) for x in self.Wo_tiled))
                 fo.write(' };\n\n')
+                if self.Bo is not None:
+                    fo.write(f'__attribute__((section(".data"))) alignas(32) int8_t b_p [{self.Bo.size}] = {{ ')
+                    fo.write(', '.join(str(int(x)) for x in self.Bo.reshape(-1)))
+                    fo.write(' };\n\n')
                 fo.write('#include "kernels.h"\n\n')
                 fo.write(f'void out{self.idx}(input_stream_int8 * __restrict x, output_stream_int8 * __restrict a){{ ')
-                fo.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_o}, {self.scale_o}, true>')
-                fo.write('(x, a, k_p);}\n')
+                has_bias_str = 'true' if self.Bo is not None else 'false'
+                fo.write(f'dense<{self.m}, {self.k}, {self.n}, {self.T//self.m}, {self.d_model//self.k}, {self.head_dim//self.n}, {self.shift_o}, {self.scale_o}, true, {has_bias_str}>')
+                if self.Bo is not None:
+                    fo.write('(x, a, k_p, b_p);}\n')
+                else:
+                    fo.write('(x, a, k_p, nullptr);}\n')
 
         self._generate_include_code()
 
