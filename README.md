@@ -1,20 +1,20 @@
 # Particle Transformer on Versal AI Engines
 
-A reusable software framework for mapping quantized transformer models to AMD Versal AI Engines (AIE). This project demonstrates an integer-only transformer implementation for jet tagging at particle accelerators, featuring a code-generation framework that automatically converts high-level Python model descriptions into optimized Vitis AIE graphs.
+A reusable software framework for mapping quantized transformer models to AMD Versal VCK190 AI Engine (AIE). This project demonstrates an integer-only transformer implementation for jet tagging at particle accelerators, featuring a code-generation framework that automatically converts high-level Python model descriptions into optimized Vitis AIE graphs.
 
 **Paper:** "Reconfigurable Computing Challenge: Transformer for Jet Tagging on Versal AI Engines" - FCCM Journal
 **Authors:** Gram Koski, Sean Lipps, Zhenghua Ma, G Abarajithan, Ryan Kastner (UC San Diego)
 
 ## Project Overview
 
-This framework addresses the challenge of deploying transformer-based neural networks in real-time, resource-constrained edge inference systems. Specifically, it targets jet tagging at the CERN LHC, where the ideal constraints are:
+This framework addresses the challenge of deploying transformer-based neural networks in real-time, resource-constrained edge inference systems. It is motivated by low-level triggers for jet tagging at particle accelerators, where the ideal constraints are:
 
 - **Input Rate:** 40 MHz collision rate
 - **Latency Budget:** A few microseconds for Level-1 Trigger decisions
 - **Throughput Requirement:** O(10⁵) events per second
 - **Constraints:** Tight on-detector power and resource budgets
 
-Traditional CPU/GPU platforms cannot meet these requirements. **This is a preliminary, unoptimized implementation that demonstrates the framework's feasibility and establishes a foundation for future optimization.** Currently, performance is limited by bottlenecks such as integer-only softmax (55+ µs latency) that prevent real-time operation at production scale. This project leverages the AMD Versal VCK190 SoC's AI Engine array for low-latency, high-throughput ML inference using quantized integer-only arithmetic, with significant potential for improvement in future work.
+Traditional CPU/GPU platforms cannot meet these requirements. **This is a preliminary, unoptimized implementation that demonstrates the framework's feasibility and establishes a foundation for future optimization.** Currently, performance is limited by bottlenecks such as integer-only softmax (55+ µs latency) that prevent real-time operation at production scale. This project leverages the AMD Versal VCK190 SoC's AI Engine array for low-latency, high-throughput ML inference using quantized integer-only arithmetic, with potential for improvement in future work.
 
 ### Key Contributions
 
