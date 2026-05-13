@@ -81,118 +81,34 @@ output = model.forward(input_data)
 Each example demonstrates different aspects of the framework. All use quantized int8 arithmetic on a 160×8 input tensor (padded from 150×3 jets with 3 features).
 
 ### 1. `skeleton.py` - Transformer Backbone (No Softmax)
-
-**Purpose:** Validate core transformer computation without softmax overhead
-**Use Case:** Demonstrates the skeleton model evaluated in the paper's benchmarks
-
-**Architecture:**
-- Dense layer (3→64) with ReLU
-- Multi-head attention (4 heads, no softmax, no bias)
-- Residual connection (skip)
-- 2 stacked transformer blocks, each with:
-  - MHA layer (4 heads, no softmax)
-  - Feed-forward: Dense(64→64)→Dense(64→64) with ReLU
-  - Residual connections
-- Output projection: Dense(64→8)
-
-**Key Features:**
-- Omits softmax and bias for latency isolation
-- Uses dynamic quantization (calibrated from input)
-- Directly maps to Table I results in the paper
-- **Performance:** 4 heads: 187.0 ms latency, 10,041.8 samples/s; 1 head: 734.6 ms latency, 2,775.3 samples/s
-
-**Run:** `python examples/skeleton.py`
-
-### 2. `mlp.py` - Simple Multi-Layer Perceptron
-
-**Purpose:** Demonstrate basic dense layer operations and quantization schemes
-**Use Case:** Validates foundational building blocks; lightweight test for framework debugging
-
-**Architecture:**
-- FC1: 8→64 with bias and ReLU (shift=15, scale=73)
-- FC2: 64→8 with bias, no ReLU (shift=15, scale=58)
-
-**Key Features:**
-- Single MLP with explicit static quantization parameters
-- No dynamic quantization; fixed quantization scales and shifts
-- Small model suitable for quick iteration and testing
-- Good starting point for understanding DenseLayer quantization
-
-**Run:** `python examples/mlp.py`
-
-### 3. `dense_softmax_model.py` - Dense Layer with Integer Softmax
-
-**Purpose:** Benchmark the integer-only softmax implementation
-**Use Case:** Demonstrates softmax layer as a separate building block; crucial for identifying performance bottlenecks
-
-**Architecture:**
-- DenseSoftmax: 64→64 layer combining dense projection and softmax
-- Input: 160×64 quantized tensor
-- Output: 160×64 softmax probabilities
-
-**Key Features:**
-- Isolated softmax performance analysis
-- Fixed quantization (no dynamic scaling)
-- **Performance Impact (from paper Table II):**
-  - Dense only: 218.3 ns latency, 697.7 MB/s throughput
-  - Dense + bias: 1,695.8 ns latency, 22.4 MB/s throughput  
-  - Dense + softmax: 55,199.2 ns latency, 4.6 MB/s throughput
-  - **Softmax introduces ~250× latency increase, identifying it as the dominant bottleneck**
-
-**Run:** `python examples/dense_softmax_model.py`
-
-### 4. `particle_transformer_no_softmax.py` - Full Transformer (No Softmax, Dynamic Quant)
-
-**Purpose:** Complete transformer pipeline with automatic quantization calibration
-**Use Case:** Production-oriented model using dynamic quantization; equivalent to skeleton but with calibration
-
-**Architecture:** Same as `skeleton.py` but with:
-- All layers include bias terms
-- Dynamic quantization enabled (auto-calibrated)
-- Quantization factors derived from reference forward pass
-
-**Key Differences from skeleton:**
-- ✓ Bias terms on dense and attention layers
-- ✓ Dynamic quantization mode (automatic parameter derivation)
-- ✗ Still no softmax (avoiding the identified bottleneck)
-- ✗ No softmax comparison needed
-
-**Run:** `python examples/particle_transformer_no_softmax.py`
-
-### 5. `particle_transformer.py` - Full Transformer (With Softmax, Static Quant)
-
-**Purpose:** Complete production transformer matching the paper's full implementation
-**Use Case:** Reference implementation with optional softmax enabling; demonstrates static quantization
-
-**Architecture:** Full transformer with:
-- Dense layer with bias and explicit quantization (shift=15, scale=115)
-- MHA with per-head static quantization scales:
-  - `scale_q, shift_q`: Query projection
-  - `scale_k, shift_k`: Key projection
-  - `scale_v, shift_v`: Value projection
-  - `scale_s, shift_s` (4 values): Per-head softmax scaling
-  - `scale_c, shift_c` (4 values): Per-head context scaling
-  - `scale_o, shift_o`: Output projection
-- Feed-forward layers with explicit quantization parameters
-
-**Key Differences from particle_transformer_no_softmax:**
-- ✓ Static quantization with explicit per-layer scales/shifts
-- ✓ Optional softmax enabling (parameter: `enable_softmax=True/False`)
-- ✓ Per-head quantization for improved precision
-- ✗ More memory bandwidth due to softmax data movement
-
-**Configuration Options:**
-```python
-# Disable softmax (faster)
-model.forward(input_data, enable_softmax=False)  
-
-# Enable softmax (production, higher latency)
-model.forward(input_data, enable_softmax=True)
+Core transformer validation (2 MHA + FFN blocks, no softmax/bias). Demonstrates paper Table I results: 4 heads: 187 µs latency, 10,042 samples/s.
+```bash
+python examples/skeleton.py
 ```
 
-**Run:** `python examples/particle_transformer.py`
+### 2. `mlp.py` - Simple Multi-Layer Perceptron
+Basic dense layers (8→64→8) with static quantization. Good for framework testing and understanding DenseLayer quantization.
+```bash
+python examples/mlp.py
+```
 
----
+### 3. `dense_softmax_model.py` - Dense Layer with Integer Softmax
+Isolated softmax benchmarking (64→64). Shows softmax bottleneck from paper Table II: ~250× latency increase.
+```bash
+python examples/dense_softmax_model.py
+```
+
+### 4. `particle_transformer_no_softmax.py` - Full Transformer (No Softmax, Dynamic Quant)
+Complete transformer with bias and dynamic quantization, no softmax. Production-oriented variant of skeleton.
+```bash
+python examples/particle_transformer_no_softmax.py
+```
+
+### 5. `particle_transformer.py` - Full Transformer (With Softmax, Static Quant)
+Full transformer with optional softmax and per-head static quantization. Reference implementation.
+```bash
+python examples/particle_transformer.py
+```
 
 ## Example Comparison Table
 
